@@ -30,4 +30,9 @@ router.post(
 
 router.get("/:id", rideController.getRide);
 
+router.patch("/:id/accept", requireRole("driver"), rideController.acceptRide);
+router.patch("/:id/start", requireRole("driver"), rideController.startRide);
+router.patch("/:id/complete", requireRole("driver"), rideController.completeRide);
+router.patch("/:id/cancel", requireRole("rider", "driver"), rideController.cancelRide);
+
 module.exports = router;
