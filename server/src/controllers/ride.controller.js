@@ -34,4 +34,60 @@ async function getRide(req, res, next) {
   }
 }
 
-module.exports = { createRide, getRide };
+async function acceptRide(req, res, next) {
+  try {
+    const ride = await rideService.acceptRide(req.params.id, req.user);
+
+    res.status(200).json({
+      success: true,
+      message: "Ride accepted successfully",
+      data: { ride },
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function startRide(req, res, next) {
+  try {
+    const ride = await rideService.startRide(req.params.id, req.user);
+
+    res.status(200).json({
+      success: true,
+      message: "Ride started successfully",
+      data: { ride },
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function completeRide(req, res, next) {
+  try {
+    const ride = await rideService.completeRide(req.params.id, req.user);
+
+    res.status(200).json({
+      success: true,
+      message: "Ride completed successfully",
+      data: { ride },
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function cancelRide(req, res, next) {
+  try {
+    const ride = await rideService.cancelRide(req.params.id, req.user);
+
+    res.status(200).json({
+      success: true,
+      message: "Ride cancelled successfully",
+      data: { ride },
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { createRide, getRide, acceptRide, startRide, completeRide, cancelRide };

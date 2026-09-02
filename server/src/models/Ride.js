@@ -71,6 +71,11 @@ const rideSchema = new mongoose.Schema(
       type: Date,
       default: null,
     },
+    cancelledBy: {
+      type: String,
+      enum: ["rider", "driver", null],
+      default: null,
+    },
   },
   { timestamps: true }
 );
