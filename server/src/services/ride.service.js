@@ -2,6 +2,7 @@ const mongoose = require("mongoose");
 const Ride = require("../models/Ride");
 const Driver = require("../models/Driver");
 const ApiError = require("../utils/ApiError");
+const matchingService = require("./matching.service");
 
 // Reserved for future days (driver acceptance, cancellation endpoints, etc.)
 // so the valid-transition map lives in one place from Day 1 onward.
@@ -29,11 +30,23 @@ async function createRide(riderId, { pickup, destination }) {
     status: "requested",
   });
 
-  return ride;
+  // Best-effort nearby-driver lookup: it only annotates the ride with a
+  // candidate for display purposes, so a lookup failure or empty result
+  // must never block ride creation itself.
+  const nearestDriver = await matchingService.findNearestAvailableDriver(pickup.location.coordinates);
+  if (nearestDriver) {
+    ride.matchedDriver = nearestDriver.user;
+    await ride.save();
+  }
+
+  return populateRide(ride._id);
 }
 
 function populateRide(rideId) {
-  return Ride.findById(rideId).populate("rider", "-password").populate("driver", "-password");
+  return Ride.findById(rideId)
+    .populate("rider", "-password")
+    .populate("driver", "-password")
+    .populate("matchedDriver", "-password");
 }
 
 async function getRideById(rideId, requestingUser) {
@@ -55,8 +68,8 @@ async function getRideById(rideId, requestingUser) {
 }
 
 async function acceptRide(rideId, driverUser) {
-  const ride = await Ride.findById(rideId);
-  if (!ride) {
+  const existingRide = await Ride.findById(rideId);
+  if (!existingRide) {
     throw new ApiError(404, "Ride not found");
   }
 
@@ -65,25 +78,46 @@ async function acceptRide(rideId, driverUser) {
     throw new ApiError(404, "Driver profile not found");
   }
 
-  assertValidTransition(ride.status, "accepted");
+  // Cheap pre-checks for the common (non-racing) case: give the caller the
+  // most specific error immediately instead of always paying for a transaction.
+  assertValidTransition(existingRide.status, "accepted");
 
   if (driver.status !== "available") {
     const reason = driver.status === "busy" ? "Driver is already busy" : "Driver must be available to accept rides";
     throw new ApiError(409, reason);
   }
 
-  // Ride and driver must flip together (accepted + busy) or not at all;
-  // Atlas is always a replica set, so a transaction is the simplest safe tool here.
+  // Race window: two drivers can both read status="requested" above before
+  // either writes, and both would believe they won. A plain `ride.save()`
+  // after that read (the Day 2 approach) would let the second writer silently
+  // overwrite the first driver's acceptance with their own. findOneAndUpdate's
+  // filter re-checks `status: "requested"` atomically at write time — only the
+  // first update matches and applies; the loser gets `null` back and a clean
+  // 409 instead of corrupting the ride. Same idea for the driver's status flip,
+  // in case this same driver is racing to accept two different rides at once.
+  // The transaction on top keeps Ride and Driver moving together — the ride
+  // is never left "accepted" with its driver still "available".
+  let ride;
   const session = await mongoose.startSession();
   try {
     await session.withTransaction(async () => {
-      ride.driver = driverUser._id;
-      ride.status = "accepted";
-      ride.acceptedAt = new Date();
-      await ride.save({ session });
+      ride = await Ride.findOneAndUpdate(
+        { _id: rideId, status: "requested" },
+        { $set: { driver: driverUser._id, status: "accepted", acceptedAt: new Date() } },
+        { new: true, session }
+      );
+      if (!ride) {
+        throw new ApiError(409, "Ride was already accepted by another driver");
+      }
 
-      driver.status = "busy";
-      await driver.save({ session });
+      const claimedDriver = await Driver.findOneAndUpdate(
+        { _id: driver._id, status: "available" },
+        { $set: { status: "busy" } },
+        { new: true, session }
+      );
+      if (!claimedDriver) {
+        throw new ApiError(409, "Driver is already busy");
+      }
     });
   } finally {
     await session.endSession();
@@ -189,9 +223,37 @@ async function cancelRide(rideId, user) {
   return populateRide(ride._id);
 }
 
+async function getMyRides(user, { page, limit } = {}) {
+  const filter = user.role === "driver" ? { driver: user._id } : { rider: user._id };
+
+  const pageNum = Math.max(1, parseInt(page, 10) || 1);
+  const limitNum = Math.min(50, Math.max(1, parseInt(limit, 10) || 10));
+
+  const [rides, totalCount] = await Promise.all([
+    Ride.find(filter)
+      .sort({ createdAt: -1 })
+      .skip((pageNum - 1) * limitNum)
+      .limit(limitNum)
+      .populate("rider", "-password")
+      .populate("driver", "-password"),
+    Ride.countDocuments(filter),
+  ]);
+
+  return {
+    rides,
+    pagination: {
+      page: pageNum,
+      limit: limitNum,
+      totalCount,
+      totalPages: Math.max(1, Math.ceil(totalCount / limitNum)),
+    },
+  };
+}
+
 module.exports = {
   createRide,
   getRideById,
+  getMyRides,
   acceptRide,
   startRide,
   completeRide,

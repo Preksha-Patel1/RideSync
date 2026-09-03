@@ -28,6 +28,8 @@ router.post(
   rideController.createRide
 );
 
+router.get("/my-rides", rideController.getMyRides);
+
 router.get("/:id", rideController.getRide);
 
 router.patch("/:id/accept", requireRole("driver"), rideController.acceptRide);

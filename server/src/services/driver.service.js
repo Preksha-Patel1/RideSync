@@ -53,4 +53,16 @@ async function updateStatus(userId, status) {
   return driver;
 }
 
-module.exports = { createProfile, getProfileByUserId, updateStatus };
+async function updateLocation(userId, coordinates) {
+  const driver = await Driver.findOne({ user: userId });
+  if (!driver) {
+    throw new ApiError(404, "Driver profile not found");
+  }
+
+  driver.currentLocation = { type: "Point", coordinates };
+  await driver.save();
+
+  return driver;
+}
+
+module.exports = { createProfile, getProfileByUserId, updateStatus, updateLocation };

@@ -34,6 +34,15 @@ const rideSchema = new mongoose.Schema(
       ref: "User",
       default: null,
     },
+    // The nearest available driver found by the matching service at request
+    // time. Advisory only — it does not gate who may accept the ride (see
+    // ride.service.js acceptRide), so a ride never gets stranded if that
+    // driver goes busy/offline before responding.
+    matchedDriver: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
     pickup: {
       type: locationSchema,
       required: true,
