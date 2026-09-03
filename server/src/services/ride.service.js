@@ -3,6 +3,7 @@ const Ride = require("../models/Ride");
 const Driver = require("../models/Driver");
 const ApiError = require("../utils/ApiError");
 const matchingService = require("./matching.service");
+const driverService = require("./driver.service");
 
 // Reserved for future days (driver acceptance, cancellation endpoints, etc.)
 // so the valid-transition map lives in one place from Day 1 onward.
@@ -73,18 +74,26 @@ async function acceptRide(rideId, driverUser) {
     throw new ApiError(404, "Ride not found");
   }
 
-  const driver = await Driver.findOne({ user: driverUser._id });
-  if (!driver) {
-    throw new ApiError(404, "Driver profile not found");
-  }
-
   // Cheap pre-checks for the common (non-racing) case: give the caller the
   // most specific error immediately instead of always paying for a transaction.
   assertValidTransition(existingRide.status, "accepted");
 
-  if (driver.status !== "available") {
-    const reason = driver.status === "busy" ? "Driver is already busy" : "Driver must be available to accept rides";
+  // Cache-aside read: on a hot path like "driver taps accept", checking
+  // Redis first (populated by driver.service.js's cache-aside/write-through)
+  // means a driver who's already busy gets rejected without a MongoDB round
+  // trip at all. This is only a fast-fail optimization, never the final
+  // word — the atomic findOneAndUpdate below re-checks status against
+  // MongoDB itself, so a stale/missing cache entry can never let two rides
+  // get assigned to one driver.
+  const cachedStatus = await driverService.getDriverStatus(driverUser._id);
+  if (cachedStatus !== "available") {
+    const reason = cachedStatus === "busy" ? "Driver is already busy" : "Driver must be available to accept rides";
     throw new ApiError(409, reason);
+  }
+
+  const driver = await Driver.findOne({ user: driverUser._id });
+  if (!driver) {
+    throw new ApiError(404, "Driver profile not found");
   }
 
   // Race window: two drivers can both read status="requested" above before
@@ -98,6 +107,7 @@ async function acceptRide(rideId, driverUser) {
   // The transaction on top keeps Ride and Driver moving together — the ride
   // is never left "accepted" with its driver still "available".
   let ride;
+  let claimedDriverForCache;
   const session = await mongoose.startSession();
   try {
     await session.withTransaction(async () => {
@@ -118,10 +128,17 @@ async function acceptRide(rideId, driverUser) {
       if (!claimedDriver) {
         throw new ApiError(409, "Driver is already busy");
       }
+
+      claimedDriverForCache = claimedDriver;
     });
   } finally {
     await session.endSession();
   }
+
+  // Keep Redis in sync the moment MongoDB's status flip is committed —
+  // otherwise the cache would keep answering "available" for up to
+  // REDIS_DRIVER_TTL_SECONDS after this driver actually went busy.
+  await driverService.syncStatusCache(claimedDriverForCache);
 
   return populateRide(ride._id);
 }
@@ -176,6 +193,10 @@ async function completeRide(rideId, driverUser) {
     await session.endSession();
   }
 
+  // See acceptRide's matching comment: MongoDB's write just committed, so
+  // Redis needs to move with it rather than wait out its TTL.
+  await driverService.syncStatusCache(driver);
+
   return populateRide(ride._id);
 }
 
@@ -200,6 +221,7 @@ async function cancelRide(rideId, user) {
 
   const assignedDriverId = ride.status === "accepted" ? ride.driver : null;
 
+  let freedDriverForCache = null;
   const session = await mongoose.startSession();
   try {
     await session.withTransaction(async () => {
@@ -213,11 +235,16 @@ async function cancelRide(rideId, user) {
         if (driver) {
           driver.status = "available";
           await driver.save({ session });
+          freedDriverForCache = driver;
         }
       }
     });
   } finally {
     await session.endSession();
+  }
+
+  if (freedDriverForCache) {
+    await driverService.syncStatusCache(freedDriverForCache);
   }
 
   return populateRide(ride._id);
