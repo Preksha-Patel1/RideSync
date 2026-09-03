@@ -4,6 +4,8 @@ const Driver = require("../models/Driver");
 const ApiError = require("../utils/ApiError");
 const matchingService = require("./matching.service");
 const driverService = require("./driver.service");
+const kafkaProducer = require("./kafkaProducer");
+const { KAFKA_TOPICS, RIDE_EVENT_TYPES } = require("../config/constants");
 
 // Reserved for future days (driver acceptance, cancellation endpoints, etc.)
 // so the valid-transition map lives in one place from Day 1 onward.
@@ -39,6 +41,19 @@ async function createRide(riderId, { pickup, destination }) {
     ride.matchedDriver = nearestDriver.user;
     await ride.save();
   }
+
+  // Database first, then publish: the event must describe something that
+  // actually happened. Publishing before Ride.create() succeeded could
+  // announce a ride.requested for a ride that was never actually persisted
+  // (e.g. if create() then threw) — readers of the event would believe
+  // something exists that MongoDB never has a record of. publishEvent()
+  // itself never throws (see kafkaProducer.js), so a Kafka outage here
+  // can't undo or fail this already-successful ride creation.
+  await kafkaProducer.publishEvent(KAFKA_TOPICS.rideEvents, RIDE_EVENT_TYPES.requested, {
+    rideId: ride._id.toString(),
+    riderId: riderId.toString(),
+    driverId: null,
+  });
 
   return populateRide(ride._id);
 }
@@ -140,6 +155,14 @@ async function acceptRide(rideId, driverUser) {
   // REDIS_DRIVER_TTL_SECONDS after this driver actually went busy.
   await driverService.syncStatusCache(claimedDriverForCache);
 
+  // Published only after the transaction above has actually committed — see
+  // createRide's comment for why this ordering is non-negotiable.
+  await kafkaProducer.publishEvent(KAFKA_TOPICS.rideEvents, RIDE_EVENT_TYPES.accepted, {
+    rideId: ride._id.toString(),
+    riderId: existingRide.rider.toString(),
+    driverId: driverUser._id.toString(),
+  });
+
   return populateRide(ride._id);
 }
 
@@ -158,6 +181,12 @@ async function startRide(rideId, driverUser) {
   ride.status = "started";
   ride.startedAt = new Date();
   await ride.save();
+
+  await kafkaProducer.publishEvent(KAFKA_TOPICS.rideEvents, RIDE_EVENT_TYPES.started, {
+    rideId: ride._id.toString(),
+    riderId: ride.rider.toString(),
+    driverId: driverUser._id.toString(),
+  });
 
   return populateRide(ride._id);
 }
@@ -196,6 +225,12 @@ async function completeRide(rideId, driverUser) {
   // See acceptRide's matching comment: MongoDB's write just committed, so
   // Redis needs to move with it rather than wait out its TTL.
   await driverService.syncStatusCache(driver);
+
+  await kafkaProducer.publishEvent(KAFKA_TOPICS.rideEvents, RIDE_EVENT_TYPES.completed, {
+    rideId: ride._id.toString(),
+    riderId: ride.rider.toString(),
+    driverId: driverUser._id.toString(),
+  });
 
   return populateRide(ride._id);
 }
@@ -246,6 +281,13 @@ async function cancelRide(rideId, user) {
   if (freedDriverForCache) {
     await driverService.syncStatusCache(freedDriverForCache);
   }
+
+  await kafkaProducer.publishEvent(KAFKA_TOPICS.rideEvents, RIDE_EVENT_TYPES.cancelled, {
+    rideId: ride._id.toString(),
+    riderId: ride.rider.toString(),
+    driverId: assignedDriverId ? assignedDriverId.toString() : null,
+    cancelledBy: ride.cancelledBy,
+  });
 
   return populateRide(ride._id);
 }
