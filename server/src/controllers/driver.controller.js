@@ -53,4 +53,23 @@ async function updateStatus(req, res, next) {
   }
 }
 
-module.exports = { createProfile, getMyProfile, updateStatus };
+async function updateLocation(req, res, next) {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      throw new ApiError(400, "Validation failed", errors.array().map((e) => ({ field: e.path, message: e.msg })));
+    }
+
+    const driver = await driverService.updateLocation(req.user._id, req.body.coordinates);
+
+    res.status(200).json({
+      success: true,
+      message: "Driver location updated successfully",
+      data: { driver },
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { createProfile, getMyProfile, updateStatus, updateLocation };

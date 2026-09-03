@@ -27,4 +27,16 @@ router.patch(
   driverController.updateStatus
 );
 
+router.patch(
+  "/location",
+  [
+    body("coordinates")
+      .isArray({ min: 2, max: 2 })
+      .withMessage("coordinates must be an array of [longitude, latitude]"),
+    body("coordinates.0").isFloat({ min: -180, max: 180 }).withMessage("longitude must be between -180 and 180"),
+    body("coordinates.1").isFloat({ min: -90, max: 90 }).withMessage("latitude must be between -90 and 90"),
+  ],
+  driverController.updateLocation
+);
+
 module.exports = router;

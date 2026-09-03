@@ -1,0 +1,3 @@
+const DRIVER_SEARCH_RADIUS_METERS = Number(process.env.DRIVER_SEARCH_RADIUS_METERS) || 5000;
+
+module.exports = { DRIVER_SEARCH_RADIUS_METERS };

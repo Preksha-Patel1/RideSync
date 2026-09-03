@@ -21,6 +21,19 @@ async function createRide(req, res, next) {
   }
 }
 
+async function getMyRides(req, res, next) {
+  try {
+    const { rides, pagination } = await rideService.getMyRides(req.user, req.query);
+
+    res.status(200).json({
+      success: true,
+      data: { rides, pagination },
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
 async function getRide(req, res, next) {
   try {
     const ride = await rideService.getRideById(req.params.id, req.user);
@@ -90,4 +103,4 @@ async function cancelRide(req, res, next) {
   }
 }
 
-module.exports = { createRide, getRide, acceptRide, startRide, completeRide, cancelRide };
+module.exports = { createRide, getMyRides, getRide, acceptRide, startRide, completeRide, cancelRide };

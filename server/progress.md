@@ -62,5 +62,39 @@ Test data (4 users, 2 drivers, 2 vehicles, 6 rides) was deleted from Atlas after
 ### Remaining (deliberately out of scope for Day 2)
 Redis, Kafka, WebSockets/Socket.IO, Razorpay, automatic driver matching, notifications, fare calculation, automated test files committed to the repo (testing was done via a throwaway script per the instruction to "create a reasonable test suite or provide a clear Postman testing flow" — a Postman flow is documented in the README since no test framework existed in the Day 1 stack).
 
+### Next Step (superseded — see Day 3 below)
+The original plan was Redis-backed driver GEO lookups; Day 3 instead did this with MongoDB geospatial queries directly, since a `2dsphere` index already existed and Redis wasn't yet justified for a single-instance learning project. Redis remains a good Day 4+ candidate once matching needs to reserve a driver with a TTL across concurrent requests.
+
+## Day 3 — Driver Matching & Geospatial Queries (COMPLETE)
+
+### Implemented
+- `src/config/constants.js` — `DRIVER_SEARCH_RADIUS_METERS`, read from `.env` (default `5000`), so the radius isn't hardcoded in the matching logic.
+- `src/services/matching.service.js` — `findNearestAvailableDriver(coordinates)`, a single `Driver.findOne` using `$near`/`$geometry`/`$maxDistance` against `Driver.currentLocation` (already `2dsphere`-indexed since Day 1). `$near` returns nearest-first, so the first `status: "available"` hit within the radius is already the closest — no extra sort needed.
+- `ride.service.js` `createRide` now calls the matching service right after creating the ride and stores the result on a new `Ride.matchedDriver` field (nullable). The ride is always created regardless of whether a driver was found — matching failure/empty-result never blocks ride creation.
+- **`matchedDriver` is advisory only** — it is not enforced as the sole driver allowed to accept. Considered gating `acceptRide` on it, but that would strand a ride forever if the matched driver goes busy/offline before responding (no other driver could ever accept it under Day 3's synchronous accept model). Enforcing that safely needs a reservation-with-timeout/fallback-to-next-driver mechanism, which is exactly the kind of thing Redis TTL keys are good for — deliberately deferred to Day 4+.
+- `PATCH /api/drivers/location` — new driver-only endpoint to update `Driver.currentLocation`, validated the same way pickup/destination already are (array of 2, lon ∈ [-180,180], lat ∈ [-90,90]).
+- `GET /api/rides/my-rides` — authenticated riders see rides where they're the rider, drivers see rides where they're the assigned driver; supports `?page=&limit=` (limit capped at 50).
+- **`acceptRide` concurrency hardening**: replaced the Day 2 pattern (`Ride.findById` → mutate → `ride.save()`) with `Ride.findOneAndUpdate({ _id, status: "requested" }, { $set: {...} }, { session, new: true })` inside the existing transaction, and the same conditional-update pattern for the driver's `available → busy` flip. See "Concurrency" below for why this matters.
+
+### Why the read-then-write pattern was unsafe
+Two drivers hitting `/accept` for the same ride at nearly the same time could both execute `Ride.findById` and see `status: "requested"` *before either one writes*. Under the old code, both would then proceed to set `status = "accepted"` and `.save()`; whichever write lands second silently overwrites the first driver's acceptance — the ride ends up "accepted" by driver B, but driver A's client already got a 200 believing they had it. `findOneAndUpdate` closes this gap because the `status: "requested"` check and the write happen as one atomic operation at the database level — the second call's filter no longer matches (status is already `"accepted"`), so it gets `null` back and the code returns a clean `409` instead of corrupting state. This is a proper first-level fix, not a full solution: it works because each ride/driver document is a single point of atomicity in MongoDB. It does **not** help across multiple documents or multiple app instances contending on a broader resource (e.g., reserving a driver against many simultaneous ride requests before any of them touch the `Ride` collection) — that class of problem is where a distributed lock (Redis `SET NX PX` or similar) becomes relevant, planned for Day 4+.
+
+### Why `2dsphere` (not `2d`)
+`2d` indexes assume flat Euclidean coordinates; `2dsphere` treats coordinates as points on a sphere (real longitude/latitude) and is required for GeoJSON `Point` queries like `$near`/`$geometry` to return geodesically-correct distances. Both `Driver.currentLocation` and `Ride.pickup.location`/`destination.location` already had `2dsphere` indexes from Day 1, so no index changes were needed for Day 3 — only the query logic was new.
+
+### Files Changed
+- New: `src/config/constants.js`, `src/services/matching.service.js`.
+- Modified: `src/models/Ride.js` (added `matchedDriver`), `src/services/ride.service.js` (matching in `createRide`, atomic `acceptRide`, new `getMyRides`, `populateRide` now also populates `matchedDriver`), `src/services/driver.service.js` (added `updateLocation`), `src/controllers/ride.controller.js` (added `getMyRides`), `src/controllers/driver.controller.js` (added `updateLocation`), `src/routes/ride.routes.js` (added `GET /my-rides`, placed before `GET /:id`), `src/routes/driver.routes.js` (added `PATCH /location`), `.env`/`.env.example` (added `DRIVER_SEARCH_RADIUS_METERS`).
+- Nothing in Day 1/2's auth, accept/start/complete/cancel authorization rules, or state machine was removed or renamed.
+
+### Testing
+Two temporary end-to-end scripts driven over real HTTP against the app running on `localhost:5050` with the live Atlas database (deleted after the run, not part of the repo):
+1. **Day 3 script** (20/20 passed): driver profile creation; ride created with no available driver → `matchedDriver: null`; ride created with one near driver (30m away) and one far driver (Delhi, outside the 5km radius) → `matchedDriver` correctly resolves to the near driver only; a driver who goes `busy` is excluded from matching for a subsequent ride; two drivers concurrently calling `/accept` on the same ride via `Promise.all` → exactly one gets `200`, the other gets a `409`/`400`, and the ride ends up `accepted` exactly once with a valid single driver; `GET /rides/my-rides` pagination (`limit`, `totalCount`, page size) for both a rider and a driver; invalid longitude on `PATCH /drivers/location` → `400`.
+2. **Day 2 regression script** (12/12 passed): full requested→accepted→started→completed lifecycle, double-accept → `400`, rider-attempts-start → `403`, cancel-after-complete → `400`, driver flips back to `available` after completion, rider cancels a requested ride, unrelated rider blocked from `GET /rides/:id` → `403`, unauthenticated create → `401`, invalid coordinates → `400` — confirming no Day 1/2 behavior regressed.
+All test users/drivers/vehicles/rides were deleted from Atlas after both runs via a throwaway cleanup script.
+
+### Remaining (deliberately out of scope for Day 3)
+Redis-based driver reservation/TTL locking, Kafka events, WebSockets/real-time ride-request push to drivers, payments, fallback-to-next-driver on decline/timeout, fare calculation, automated test files committed to the repo (same rationale as Day 2 — no test framework in the stack yet).
+
 ### Next Step
-Day 3: introduce Redis for driver availability/location and nearby-driver GEO lookups, without touching the Day 1/2 REST surface.
+Day 4: Kafka events (`RIDE_REQUESTED`, `DRIVER_ASSIGNED`, `RIDE_ACCEPTED`, `RIDE_STARTED`, `RIDE_COMPLETED`, `RIDE_CANCELLED`) and a Redis-backed reservation step so a matched driver can be "held" with a TTL while they're notified, falling back to the next-nearest driver on decline/timeout instead of leaving matching purely advisory.
