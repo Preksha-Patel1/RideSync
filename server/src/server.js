@@ -7,6 +7,7 @@ const connectDB = require("./config/db");
 const { connectRedis, client: redisClient } = require("./config/redis");
 const { connectProducer, disconnectProducer } = require("./services/kafkaProducer");
 const { startRideEventConsumer, stopRideEventConsumer } = require("./consumers/rideEventConsumer");
+const { startPaymentEventConsumer, stopPaymentEventConsumer } = require("./consumers/paymentEventConsumer");
 const { initSocket, getIO } = require("./config/socket");
 
 const PORT = process.env.PORT || 5000;
@@ -41,6 +42,7 @@ async function start() {
     // path is the exception, not the common case.
     await connectProducer();
     await startRideEventConsumer();
+    await startPaymentEventConsumer();
 
     httpServer.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`);
@@ -72,6 +74,7 @@ async function shutdown(signal) {
   }
 
   await stopRideEventConsumer();
+  await stopPaymentEventConsumer();
   await disconnectProducer();
 
   if (redisClient.isOpen) {

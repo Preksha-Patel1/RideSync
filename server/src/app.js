@@ -4,6 +4,7 @@ const cors = require("cors");
 const authRoutes = require("./routes/auth.routes");
 const driverRoutes = require("./routes/driver.routes");
 const rideRoutes = require("./routes/ride.routes");
+const paymentRoutes = require("./routes/payment.routes");
 const { notFoundHandler, errorHandler } = require("./middleware/error.middleware");
 
 const app = express();
@@ -21,6 +22,7 @@ app.get("/api/health", (_req, res) => {
 app.use("/api/auth", authRoutes);
 app.use("/api/drivers", driverRoutes);
 app.use("/api/rides", rideRoutes);
+app.use("/api/payments", paymentRoutes);
 
 app.use(notFoundHandler);
 app.use(errorHandler);

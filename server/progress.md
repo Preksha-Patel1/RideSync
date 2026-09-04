@@ -271,5 +271,71 @@ All test data was deleted from Atlas after each run; Redis was flushed between r
 ### Remaining (deliberately out of scope for Day 6)
 Razorpay/payments, driver reservation-with-TTL (still advisory), transactional outbox, dead-letter topics, idempotent consumer/socket-event deduplication, Redis Socket.IO adapter / multi-server scaling (see "What changes with multiple server instances" below — documented, not built), production-grade rate limiting (the 2s throttle is intentionally simple), reconnection state synchronization beyond "the client re-joins its room," Docker/Kubernetes/AWS.
 
+### Next Step (superseded — see Day 7 below)
+Day 7 focused on simulated payments + idempotency, per this session's explicit scope, rather than logging/test-framework/observability work. Those remain open — see Day 7's own "Next Step" below.
+
+## Day 7 — Simulated Payments, Idempotency & Reliability Polish (COMPLETE)
+
+**No Docker anywhere — unchanged from Days 5/6.** No new infrastructure was needed for Day 7 beyond what already existed (MongoDB, Redis, Kafka); a new `payment-events` Kafka topic was added using the same native local Kafka broker from Day 5.
+
+### Implemented
+- `src/models/Payment.js` — a dedicated model, deliberately not fields bolted onto `Ride` (ride lifecycle and payment lifecycle are separate state machines). Fields: `ride` (unique index — see "1:1 by construction" below), `rider`, `amount`, `currency`, `status` (`pending|success|failed`), `paymentMethod` (`"simulated"`), `idempotencyKey`, `providerReference`, `paidAt`, `failedAt`, `failureReason`.
+- `src/services/fare.service.js` — `calculateDistanceKm` (Haversine, great-circle distance between the ride's own pickup/destination GeoJSON points) and `calculateFare(ride)` (`baseFare + distanceKm*perKm + durationMinutes*perMinute`, rounded to 2 decimals), reading only from the ride's own persisted `startedAt`/`completedAt`/coordinates — never from a request body.
+- `src/services/paymentProviders/simulatedPaymentProvider.js` — the one seam meant to change when a real gateway is integrated (see "Future Razorpay extension" below). Exports `charge({ requestedResult })` returning `{ status, providerReference, failureReason }`.
+- `src/services/payment.service.js` — `createPayment`, `getPaymentById`, `simulatePayment`, plus a `VALID_TRANSITIONS`/`assertValidTransition` pair mirroring `ride.service.js`'s exact pattern. This is where fare calculation, ownership checks, the payment state machine, idempotency, and the concurrency-safe atomic update all live — see "Idempotency + concurrency" below for the mechanics.
+- `src/consumers/paymentEventConsumer.js` — a new, separate Kafka consumer (own topic `payment-events`, own consumer group `ridesync-payment-consumers`), structurally identical to `rideEventConsumer.js`: validates, logs, and bridges to Socket.IO (`payment_status_updated`, broadcast to the ride's existing `ride:<rideId>` room — no new room type needed).
+- `src/controllers/payment.controller.js` + `src/routes/payment.routes.js` — `POST /api/payments/:rideId`, `GET /api/payments/:paymentId`, `POST /api/payments/:paymentId/pay`, mounted at `/api/payments` in `app.js`. Thin controllers, same style as `ride.controller.js` — all business logic lives in the service.
+- `src/server.js` — `startPaymentEventConsumer()`/`stopPaymentEventConsumer()` added alongside the existing ride consumer in the startup/shutdown sequence.
+- `src/config/constants.js` — `KAFKA_TOPICS.paymentEvents`, `PAYMENT_CONSUMER_GROUP`, `PAYMENT_EVENT_TYPES`, `FARE_CONFIG`, `PAYMENT_CURRENCY`, `SOCKET_EVENTS.serverToClient.paymentStatusUpdated`.
+- `.env`/`.env.example` — `FARE_BASE`, `FARE_PER_KM`, `FARE_PER_MINUTE`, `PAYMENT_CURRENCY`. No Razorpay keys — Razorpay is not integrated.
+
+### Reused, not rebuilt
+`Ride.fare` already existed as a field since Day 1 and was always `null` — Day 7 is the first thing that ever populates it (as an informational snapshot; `Payment.amount` is the actual authoritative charge, immutable once the payment exists). No changes were needed to `ride.service.js`, `matching.service.js`, `driver.service.js`, or any Day 1–6 route/controller — payment creation is a rider-triggered REST call (`POST /api/payments/:rideId`) after the ride is already `completed`, not something `completeRide` triggers automatically, keeping the two domains' code fully decoupled.
+
+### 1:1 by construction, not by convention
+`paymentSchema.index({ ride: 1 }, { unique: true })` makes "at most one payment per ride" a database-enforced fact, not an application-level check that could race. This is also what makes concurrent duplicate-`createPayment` requests safe: both attempt `Payment.create(...)`, MongoDB allows exactly one to succeed, and the loser's driver-level `E11000` duplicate-key error is caught and turned into "fetch and return the existing payment" (`201` for the winner, `200` for the loser) — an idempotent-create, not an error, matching the brief's "repeated requests should safely return the existing result."
+**Known limitation, stated deliberately:** because this is a *permanent* 1:1 relationship, a `FAILED` payment cannot be retried by creating a new `Payment` for the same ride — the unique index would reject it, and re-opening a terminal payment back to `pending` is explicitly an invalid transition. A real system would need a considered decision here (allow a new attempt referencing the same ride? version the payment? add an explicit retry endpoint?) — deliberately not designed today, since the brief didn't ask for retry semantics and guessing at one risks over-engineering a small piece of a learning project.
+
+### Idempotency + concurrency (the core Day 7 mechanic)
+`POST /api/payments/:paymentId/pay` requires an `Idempotency-Key` header (rejected with `400` if missing — deliberately required, not optional, given how central this concept is to the day). `payment.service.js#simulatePayment`:
+1. Loads the payment, checks the caller owns it (`403` otherwise).
+2. **Idempotent replay check**: if `payment.idempotencyKey` already equals the incoming key, returns the already-settled payment as-is — no re-processing, no second call to the provider, no second Kafka event. This is what makes "the rider double-clicks PAY" or "the client retries after a lost response" safe.
+3. If the payment isn't `pending`, rejects with `409` (a genuinely different attempt to pay an already-settled payment, not a replay).
+4. Calls `simulatedPaymentProvider.charge(...)` to get the (simulated) outcome.
+5. Applies the result via `Payment.findOneAndUpdate({ _id, status: "pending" }, { $set: {...} })` — the exact same atomic-conditional-update pattern as Day 3's `acceptRide`. Two concurrent `pay` calls can both pass steps 1–4 before either writes; this filter re-checks `status: "pending"` atomically at write time, so only the first one actually applies. The loser reloads the payment: if the *winner* used the same idempotency key (a genuine race between duplicate copies of the same logical request), that's still a valid replay and returns the winner's result; otherwise it's correctly rejected with `409`.
+6. Only after that write commits does it publish `payment.success`/`payment.failed` to Kafka — MongoDB is the source of truth for whether a payment succeeded, never Kafka's publish outcome.
+
+This mirrors the brief's explicit instruction not to rely on Redis for financial idempotency: the idempotency key lives on the `Payment` document in MongoDB, checked and enforced there, not in a Redis-backed dedup cache. Redis's role in this project (Day 4) is completely untouched by Day 7 — driver status/location/geo caching, nothing payment-related.
+
+### Payment lifecycle vs. ride lifecycle — independent state machines
+```text
+Ride:     requested → accepted → started → completed        (terminal)
+Payment:                                    pending → success (terminal)
+                                                     → failed  (terminal)
+```
+A `completed` ride with a `pending` (or even `failed`) payment is valid and expected — nothing about a payment outcome rolls the ride back to another status, and nothing about ride state gates anything except the *initial* payment-creation check (`ride.status === "completed"`). Verified directly: after a simulated payment failure, the ride's own status remains `completed`.
+
+### Testing
+All against the real local stack (native Redis, native Kafka, live Atlas MongoDB, real `socket.io-client` connections), driven with a throwaway script (deleted after the run) plus independent Kafka CLI/kafkajs-admin verification:
+1. **Core suite (34/34 passed)**: fare math verified two ways — the app's returned amount matched an independently-computed Haversine+fare calculation to the cent; payment creation rejected for a non-completed ride (`400`), a non-owning rider (`403`), and an invalid ride id (`400`, via the existing Mongoose `CastError` → 400 mapping, no new validation code needed); successful creation (`201`), `ride.fare` persisted; duplicate creation returns the same payment (`200`, not a new `201`); unauthorized `GET` rejected (`403`); `pay` without an `Idempotency-Key` rejected (`400`); successful simulated payment (`paidAt`, `providerReference` populated) with a live `payment_status_updated` Socket.IO event received by the rider; the *exact same* idempotency key replayed returns the identical `paidAt` (proving no re-processing); a *different* key against an already-settled payment correctly rejected (`409`); unauthorized `pay` rejected; failure branch (`failedAt`/`failureReason` populated, `payment_status_updated` with `status: "failed"` received live, ride status confirmed still `completed`).
+2. **Concurrency (both required scenarios passed)**: two simultaneous `pay` requests (different idempotency keys, one requesting success and one requesting failure) for the same pending payment — exactly one returned `200`, the other `409`, and the payment settled exactly once. Two simultaneous `createPayment` requests for the same ride — both returned the same payment id (one `201`, one `200`), confirmed via the unique index, not an application-level race-prone check.
+3. **Independent Kafka verification**: a separate kafkajs consumer (its own throwaway consumer group, `fromBeginning: true`) read every message off `payment-events` directly, bypassing this app's own consumer entirely — confirmed exactly one `payment.created` and exactly one settlement event (`payment.success` or `payment.failed`, never both, never duplicated) per payment across every scenario including both concurrency races.
+4. **Regression**: Day 2 (12/12), Day 3 (20/20), Day 4 (12/12), Day 5 (6/6), and Day 6 (24/24) scripts all re-run after the Day 7 changes — all still pass, confirming payments were added without disturbing any earlier day's guarantees.
+All test data (including `Payment` documents) was deleted from Atlas after each run; Redis was flushed between runs.
+
+### A real environment hiccup, documented honestly
+Partway through this session the sandbox VM appears to have been suspended and resumed (a date change was reported mid-session), which left the long-running Kafka broker in a degraded state (repeated heartbeat timeouts, slow `__consumer_offsets` recovery) and — separately — revealed roughly 30 orphaned `nodemon`/`npm run dev` processes that had accumulated across every EADDRINUSE crash-loop since Day 3, never cleaned up, which were themselves causing severe system-wide sluggishness. Both were fixed by brute force: killing every stray `node.exe` process and restarting the Kafka broker cleanly. Worth recording as a real lesson: long-lived local dev infrastructure (a broker or a watch process left running across many sessions) can accumulate state and orphaned processes in ways that eventually degrade the whole environment, not just the one thing you're actively working on.
+
+### Files Changed
+- New: `src/models/Payment.js`, `src/services/fare.service.js`, `src/services/payment.service.js`, `src/services/paymentProviders/simulatedPaymentProvider.js`, `src/consumers/paymentEventConsumer.js`, `src/controllers/payment.controller.js`, `src/routes/payment.routes.js`.
+- Modified: `src/app.js` (mounted `/api/payments`), `src/server.js` (payment consumer start/stop), `src/config/constants.js` (payment/fare constants), `.env`/`.env.example` (`FARE_BASE`, `FARE_PER_KM`, `FARE_PER_MINUTE`, `PAYMENT_CURRENCY`).
+- No changes to any Day 1–6 model, service, controller, or route. No new npm dependencies.
+
+### Future Razorpay extension
+Swapping the simulator for a real provider means writing `razorpayPaymentProvider.js` with the same `charge({...}) -> { status, providerReference, failureReason }` shape (likely backed by a webhook handler rather than a synchronous return, which would need a small addition — but the `Payment` model, state machine, controller, routes, Kafka events, and Socket.IO notifications would not change). This is the concrete payoff of programming against the `PaymentProvider` abstraction from day one instead of coupling `payment.service.js` directly to one vendor's SDK.
+
+### Remaining (deliberately out of scope for Day 7)
+Razorpay (by explicit instruction), retrying a failed payment (see "1:1 by construction" above), refunds, wallets, coupons, surge pricing, transactional outbox (the publish-after-commit gap from Day 5 applies identically to payment events — same documented tradeoff, not newly introduced), a real automated test framework (still throwaway scripts), rate limiting, structured logging/observability, Docker/Kubernetes/AWS.
+
 ### Next Step
-Day 7: logging, a real test framework (this project has been tested exclusively via throwaway scripts through Day 6), rate limiting, retry strategy, observability, deployment prep — and, if still in scope, the Razorpay payment flow and/or the driver-reservation-with-TTL that Day 6's real-time layer now makes viable.
+This closes the originally planned 7-day build. Natural next steps: a real Razorpay integration behind the existing `PaymentProvider` abstraction; a driver-reservation-with-TTL on top of Day 6's real-time layer; a proper automated test suite (Jest/Mocha) replacing the throwaway scripts used through every day of this build; structured logging, rate limiting, and observability for anything resembling production readiness.

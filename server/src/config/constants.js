@@ -28,8 +28,18 @@ const REDIS_KEYS = {
 // Centralized here for the same reason as REDIS_KEYS above: every producer/
 // consumer that touches Kafka agrees on one topic name and one consumer
 // group id instead of duplicating string literals.
+//
+// payment-events is a separate topic from ride-events, not reused, even
+// though every payment belongs to exactly one ride: payments are a distinct
+// domain (their own state machine, their own lifecycle, their own future
+// growth — refunds, retries, multiple providers) that happens to reference
+// a ride, the same way an order-service's events stay on their own topic
+// even though every order references a customer. Splitting by domain now
+// means a future payment-only consumer (e.g. a reconciliation job) can
+// subscribe to payment-events without also receiving every ride.* event.
 const KAFKA_TOPICS = {
   rideEvents: "ride-events",
+  paymentEvents: "payment-events",
 };
 
 // A consumer group is how Kafka tracks "how far has this logical consumer
@@ -40,6 +50,11 @@ const KAFKA_TOPICS = {
 // code change — they'd just join this same group and Kafka would divide
 // the topic's partitions between them automatically.
 const KAFKA_CONSUMER_GROUP = "ridesync-ride-consumers";
+
+// A separate consumer group from KAFKA_CONSUMER_GROUP above — payments and
+// ride-lifecycle processing are independent concerns and should be able to
+// fail, restart, or scale without affecting each other's offsets.
+const PAYMENT_CONSUMER_GROUP = "ridesync-payment-consumers";
 
 // Event *names* describe something that already happened (past tense),
 // deliberately distinct from the *command* endpoints that triggered them
@@ -53,6 +68,24 @@ const RIDE_EVENT_TYPES = {
   cancelled: "ride.cancelled",
 };
 
+const PAYMENT_EVENT_TYPES = {
+  created: "payment.created",
+  success: "payment.success",
+  failed: "payment.failed",
+};
+
+// Fare is deliberately simple and fully backend-controlled — see
+// services/fare.service.js. Configurable via .env rather than hardcoded so
+// pricing can be tuned without a code change, same reasoning as
+// DRIVER_SEARCH_RADIUS_METERS above.
+const FARE_CONFIG = {
+  baseFare: Number(process.env.FARE_BASE) || 50,
+  perKm: Number(process.env.FARE_PER_KM) || 15,
+  perMinute: Number(process.env.FARE_PER_MINUTE) || 2,
+};
+
+const PAYMENT_CURRENCY = process.env.PAYMENT_CURRENCY || "INR";
+
 // Client->server and server->client socket event names, centralized for the
 // same reason as the Kafka/Redis constants above — one name per concept,
 // agreed on by every file that emits or listens for it.
@@ -65,6 +98,7 @@ const SOCKET_EVENTS = {
     rideJoined: "ride_joined",
     rideStatusUpdated: "ride_status_updated",
     driverLocationUpdated: "driver_location_updated",
+    paymentStatusUpdated: "payment_status_updated",
     rideError: "ride_error",
   },
 };
@@ -76,6 +110,10 @@ module.exports = {
   REDIS_KEYS,
   KAFKA_TOPICS,
   KAFKA_CONSUMER_GROUP,
+  PAYMENT_CONSUMER_GROUP,
   RIDE_EVENT_TYPES,
+  PAYMENT_EVENT_TYPES,
+  FARE_CONFIG,
+  PAYMENT_CURRENCY,
   SOCKET_EVENTS,
 };
