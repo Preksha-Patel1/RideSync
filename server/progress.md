@@ -198,5 +198,78 @@ All test data was deleted from Atlas and Redis/the Kafka topic were left contain
 ### Remaining (deliberately out of scope for Day 5)
 WebSockets/Socket.IO, real-time ride tracking, Razorpay/payments, driver reservation-with-TTL (still advisory, unchanged from Day 3/4), transactional outbox (mentioned above as the real fix for the publish-after-commit consistency gap, not implemented), dead-letter topics, idempotent consumer deduplication (every event already carries a unique `eventId` that such a check would key off, but the check itself isn't implemented), Kafka Streams, multi-consumer scaling (the consumer group is named and ready for it, but only one consumer instance runs), Docker/Kubernetes/AWS for the app itself.
 
+### Next Step (superseded — see Day 6 below)
+The plan above (WebSockets, then payments) proceeded as described — Day 6 built WebSockets/Socket.IO.
+
+## Day 6 — WebSockets & Real-Time Ride Updates (COMPLETE)
+
+**No Docker anywhere, by explicit requirement — extended this session to Redis too.** Day 4's Redis had been running in a Docker container (`ridesync-redis`) purely as a local-dev convenience; that container was stopped and removed, and Redis now runs as a native Windows process instead (portable `redis-server.exe`, no installer, no container) — see "Redis moved off Docker" below. Kafka (Day 5) was already Docker-free and is unaffected.
+
+### Redis moved off Docker
+Attempted the "proper" native-Windows path first — Memurai Developer (a modern, Redis-7-compatible Windows service) via `winget install Memurai.MemuraiDeveloper` — but its installer failed in this sandbox (MSI custom action couldn't create a temp directory, error 1603/access denied, unrelated to this project's code). Fell back to a portable, installer-free Redis-for-Windows build ([tporadowski/redis](https://github.com/tporadowski/redis), Redis 5.0.14.1 — a maintained fork of the old Microsoft Open Tech port): download the zip, extract, run `redis-server.exe redis.windows.conf` directly, same as Kafka's approach in Day 5. No MSI, no service install, no Docker. It listens on the same `localhost:6379` as before, so `REDIS_URL` needed no change.
+**One real consequence, not hidden:** Redis 5.0.14.1 predates the `GEOSEARCH` command (added in Redis 6.2), so Day 4's `redisService.geoSearchNearest` now always fails with "unknown command" against this specific local server. That failure is caught, logged as a warning, and falls straight through to the Day 3 MongoDB `$near` query — exactly the graceful-degradation path Day 4 was designed for, just triggered by a version gap instead of downtime. Confirmed directly: Day 4's regression test still passes 12/12 on this Redis version, because the fallback makes the outcome identical either way. `GEOADD`/`ZREM`/`GET`/`SET ... EX` (everything else Redis-related in this project) are all long-supported and work normally.
+
+### Implemented
+- `src/config/socket.js` — creates the Socket.IO server via `new Server(httpServer, {...})`, attached to the **same** underlying HTTP server `server.js` already creates for Express (one process, one port — not a second backend). Registers the JWT auth middleware (`io.use(...)`) and the per-connection handler that logs connect/disconnect and wires up ride-room handlers. Exposes `getIO()` so other modules (the Kafka consumer) can reach the same instance without a circular import.
+- `src/middleware/socketAuth.middleware.js` — the socket-handshake equivalent of `auth.middleware.js`'s `authenticate()`. Reads the JWT from `socket.handshake.auth.token` (not an `Authorization` header — there's no per-message header on a persistent connection), verifies it with the same `JWT_SECRET`/`User` lookup as REST, and attaches a minimal `socket.user = { id, role }`. Rejects with `next(new Error(...))` on any failure, which Socket.IO turns into a `connect_error` on the client before a connection is ever established — no unauthenticated socket is ever handed a connected state.
+- `src/sockets/rideSocket.js` — registers this project's two real-time events on each authenticated socket:
+  - `join_ride` — loads the ride, checks the caller is the rider or the *currently assigned* driver (same ownership rule as REST's `getRideById`/`cancelRide`), and only then `socket.join('ride:<rideId>')`. Anyone else gets `ride_error`, never a joined room.
+  - `driver_location_update` — validates role (driver only), payload shape/coordinate ranges, ride existence, that the caller is *this* ride's assigned driver, and that the ride is `accepted`/`started` (not `requested`/`completed`/`cancelled`) — then a simple 2-second per-driver in-memory throttle (silently drops, doesn't error) — then writes to Redis (`driverService.updateLiveLocation`, Redis-only, see below) and broadcasts `driver_location_updated` to the ride's room.
+- `src/services/driver.service.js` — added `updateLiveLocation(rideId, { latitude, longitude })`: writes `{ latitude, longitude, updatedAt }` to a new Redis key `ride:<rideId>:driver-location` (TTL `REDIS_RIDE_LOCATION_TTL_SECONDS`, default 120s, refreshed on every update). Deliberately separate from the existing REST `updateLocation` (Day 3/4), which still writes to MongoDB — see "Why driver location bypasses MongoDB" below.
+- `src/consumers/rideEventConsumer.js` — added `broadcastRideStatus(event)`, called right after each Kafka event is logged as processed: derives the ride status from the event type (`"ride.accepted"` → `"accepted"`) and calls `getIO().to('ride:<rideId>').emit("ride_status_updated", {...})`. This is the one place Kafka and Socket.IO actually meet. If `getIO()` returns `null` (Socket.IO not yet initialized), it logs a warning and skips — same degrade-don't-crash pattern as everywhere else in this project.
+- `src/config/constants.js` — added `SOCKET_EVENTS` (`join_ride`, `driver_location_update`, `ride_joined`, `ride_status_updated`, `driver_location_updated`, `ride_error`), `REDIS_RIDE_LOCATION_TTL_SECONDS`, and `REDIS_KEYS.rideDriverLocation` — centralized, same reasoning as every other constants addition in this project.
+- `src/server.js` — now creates `http.createServer(app)` explicitly (instead of letting `app.listen()` create one implicitly) so Socket.IO can attach before the port opens; `initSocket(httpServer)` runs before `connectProducer()`/`startRideEventConsumer()`, since the consumer's broadcast needs `io` to exist. Graceful shutdown now closes Socket.IO first (`io.close()`, which also closes the underlying HTTP server it was attached to) instead of calling `httpServer.close()` directly.
+- `.env`/`.env.example` — added `REDIS_RIDE_LOCATION_TTL_SECONDS` (default `120`).
+- `package.json` — added `socket.io` (runtime) and `socket.io-client` (devDependency, used only by this session's test scripts to drive real socket connections — not required by the app itself).
+
+### Command vs event vs real-time push — three different jobs
+This project now has three distinct ways something can happen, and it's worth being precise about which is which: a **command** (`PATCH /rides/:id/accept`) is a synchronous REST request that can be refused right now. An **event** (`ride.accepted` on Kafka) is an asynchronous, backend-internal record that something already happened — durable-ish, replayable in principle, consumed by any number of backend processes that don't need to be running at the moment it's produced. A **real-time push** (`ride_status_updated` over Socket.IO) is neither: it's an ephemeral, best-effort notification to whichever specific clients happen to be connected *right now* — if nobody's listening, it's simply gone, there's nothing to replay. REST creates state, Kafka carries the fact that state changed to other backend processes, Socket.IO tells a live human about it.
+
+### Why driver location bypasses MongoDB (Socket.IO path only)
+A driver's location can change every couple of seconds while a ride is active. Writing every one of those to MongoDB — a durable, disk-backed, replicated write — for data that's obsolete a few seconds later would mean most of MongoDB's write volume in a busy system is churn nobody will ever query historically. Redis already exists in this project specifically for fast-changing, cheap-to-lose state (Day 4); a ride's live location is exactly that. This is why `updateLiveLocation` writes only to Redis, while the existing REST `PATCH /api/drivers/location` (unchanged) still writes to MongoDB — that endpoint is called occasionally, not on every GPS tick, so the cost/benefit is completely different. `Driver.currentLocation` in MongoDB stays a coarser, periodic snapshot; the ride room's live stream is Redis + Socket.IO only.
+
+### Why the ride's live-location key is separate from Day 4's matching geo set
+Day 4's `drivers:geo` Redis set has one documented invariant: it contains exactly the currently-*available*, matchable drivers — a driver goes `busy` on accept and is explicitly removed from it. A driver's position during an *active ride* has nothing to do with matchability (they're `busy`, correctly excluded from matching), so reusing that same key for "where is this ride's driver right now" would either violate that invariant or require bypassing it with special-case logic. A new, ride-scoped key (`ride:<rideId>:driver-location`) keeps both invariants simple and independently true.
+
+### Basic flood protection
+A 2-second per-driver throttle (in-memory `Map`, see `rideSocket.js`) silently drops `driver_location_update` events arriving faster than that — not an error response, since the driver's client isn't doing anything wrong by sampling GPS frequently; this just decides how much of that stream the server acts on and re-broadcasts. Verified directly: a second update sent immediately after the first does not produce a second `driver_location_updated` broadcast to the rider.
+
+### Real-time ride flow (as implemented)
+```
+Driver taps "Start"
+  → PATCH /rides/:id/start (REST, unchanged from Day 2/3)
+  → MongoDB updated
+  → ride.started published to Kafka (Day 5, unchanged)
+  → rideEventConsumer processes it, calls broadcastRideStatus()
+  → io.to("ride:<rideId>").emit("ride_status_updated", { status: "started", ... })
+  → rider's connected socket (already in that room via join_ride) receives it live
+
+Driver's phone sends a GPS tick
+  → socket.emit("driver_location_update", { rideId, latitude, longitude })
+  → rideSocket.js validates role/ownership/ride-status/throttle
+  → driverService.updateLiveLocation() writes to Redis (not MongoDB)
+  → io.to("ride:<rideId>").emit("driver_location_updated", { location, ... })
+  → rider receives it live, no Kafka involved — this path is REST-free and Kafka-free by design, since it's driven by an inbound socket event, not a MongoDB-backed command
+```
+
+### Testing
+All against the real local stack (native Redis, native Kafka, live Atlas MongoDB), driven with real `socket.io-client` connections over WebSocket transport, via throwaway scripts (deleted after the run):
+1. **Core Socket.IO suite (24/24 passed)**: invalid JWT and missing JWT both rejected at handshake (`connect_error`, connection never established); valid JWT connects for rider/driver; rider can join their own ride's room; an unrelated user cannot; a driver who isn't yet assigned (ride still `requested`) cannot join, but can immediately after accepting; `ride_status_updated` received live for `accepted`/`started`/`completed`/`cancelled`, each traced end-to-end from the REST call through Kafka to the socket event; a rider attempting `driver_location_update` is rejected (role check); the assigned driver's location update reaches the rider live; invalid coordinates rejected; a *different* driver (not assigned to this ride) is rejected; a rapid second location update within the 2s throttle window produces no second broadcast; a location update after the ride is `completed` is rejected.
+2. **Redis verification**: `redis-cli GET ride:<rideId>:driver-location` showed the exact last-sent coordinates with a live, counting-down TTL — confirming the write path, not just the broadcast.
+3. **Malformed/invalid input (3/3 passed)**: a non-ObjectId string as `rideId` on both `join_ride` and `driver_location_update` rejected with `ride_error`; a well-formed but nonexistent ride id rejected with "Ride not found".
+4. **Redis-down (4/4 passed)**: with the native Redis process killed, `driver_location_update` still broadcast `driver_location_updated` to the rider correctly — only the Redis-side "last known position" cache silently no-ops (per `redisService.set`'s existing degrade-safe behavior from Day 4); nothing in the socket path depends on Redis succeeding.
+5. **Kafka-down (5/5 passed)**: with the Kafka broker killed, `accept`/`start`/`complete` REST calls all still returned `200`; no `ride_status_updated` was broadcast for them (expected and correct — the consumer never received an event to broadcast) and nothing crashed.
+6. **Regression**: Day 2 (12/12), Day 3 (20/20), Day 4 (12/12 — including on the now-native, GEOSEARCH-less Redis, confirmed still falling back correctly), and Day 5 (6/6) scripts all re-run after the Day 6 changes — all still pass.
+All test data was deleted from Atlas after each run; Redis was flushed between runs.
+
+### Files Changed
+- New: `src/config/socket.js`, `src/middleware/socketAuth.middleware.js`, `src/sockets/rideSocket.js`.
+- Modified: `src/config/constants.js` (`SOCKET_EVENTS`, `REDIS_RIDE_LOCATION_TTL_SECONDS`, `REDIS_KEYS.rideDriverLocation`), `src/services/driver.service.js` (`updateLiveLocation`), `src/consumers/rideEventConsumer.js` (`broadcastRideStatus`), `src/server.js` (explicit `http.createServer`, Socket.IO init in the startup sequence, shutdown now closes `io` instead of `httpServer` directly), `.env`/`.env.example` (`REDIS_RIDE_LOCATION_TTL_SECONDS`), `package.json`/`package-lock.json` (`socket.io`, `socket.io-client`).
+- Nothing in Day 1–5's REST endpoints, controllers, ride state machine, Redis cache-aside logic, or Kafka producer/consumer's own event-publishing behavior was removed, renamed, or had its business logic duplicated into the socket layer (per the explicit "don't duplicate business logic in Socket.IO" instruction — sockets here only ever read ride state to authorize, and write ephemeral location data; every ride *state transition* still goes exclusively through `ride.service.js`).
+- No Docker files were added (none existed before, either). The Docker-based `ridesync-redis` container from Day 4 was stopped and removed as part of moving Redis off Docker — see above.
+
+### Remaining (deliberately out of scope for Day 6)
+Razorpay/payments, driver reservation-with-TTL (still advisory), transactional outbox, dead-letter topics, idempotent consumer/socket-event deduplication, Redis Socket.IO adapter / multi-server scaling (see "What changes with multiple server instances" below — documented, not built), production-grade rate limiting (the 2s throttle is intentionally simple), reconnection state synchronization beyond "the client re-joins its room," Docker/Kubernetes/AWS.
+
 ### Next Step
-Day 6 (per this session's reordering — see note above): WebSockets/Socket.IO for real-time ride and driver-location updates, and/or the Razorpay payment flow. WebSockets are also what finally makes a safe driver-reservation-with-timeout worth building on top of Day 3/4's advisory matching, since only then can a "held" driver actually be notified and given a chance to respond before falling back to the next-nearest candidate.
+Day 7: logging, a real test framework (this project has been tested exclusively via throwaway scripts through Day 6), rate limiting, retry strategy, observability, deployment prep — and, if still in scope, the Razorpay payment flow and/or the driver-reservation-with-TTL that Day 6's real-time layer now makes viable.

@@ -2,7 +2,7 @@ const Driver = require("../models/Driver");
 const Vehicle = require("../models/Vehicle");
 const ApiError = require("../utils/ApiError");
 const redisService = require("./redis.service");
-const { REDIS_DRIVER_TTL_SECONDS, REDIS_KEYS } = require("../config/constants");
+const { REDIS_DRIVER_TTL_SECONDS, REDIS_RIDE_LOCATION_TTL_SECONDS, REDIS_KEYS } = require("../config/constants");
 
 async function createProfile(userId, { vehicleType, brand, model, registrationNumber }) {
   const existingDriver = await Driver.findOne({ user: userId });
@@ -105,6 +105,22 @@ async function updateLocation(userId, coordinates) {
   return driver;
 }
 
+// Deliberately Redis-only — this is called on every real-time
+// driver_location_update socket event (potentially every couple of
+// seconds), and MongoDB is not the right place for that write volume for
+// data this transient. `Driver.currentLocation` in MongoDB still gets
+// updated, just separately and far less often, via the existing REST
+// PATCH /api/drivers/location endpoint (updateLocation, above) — that path
+// remains unchanged. If Redis is unavailable, this simply becomes a no-op
+// (redisService.set already degrades that way) — the socket broadcast to
+// the ride room still happens regardless, since live delivery to the rider
+// doesn't depend on Redis at all, only the "last known position" cache does.
+async function updateLiveLocation(rideId, { latitude, longitude }) {
+  const key = REDIS_KEYS.rideDriverLocation(rideId);
+  const value = JSON.stringify({ latitude, longitude, updatedAt: new Date().toISOString() });
+  return redisService.set(key, value, REDIS_RIDE_LOCATION_TTL_SECONDS);
+}
+
 // Whenever a driver's status changes anywhere in the app (here, or from
 // ride.service.js on accept/complete/cancel), the Redis copy has to move
 // with it — otherwise a driver who just went "busy" would keep reading back
@@ -136,5 +152,6 @@ module.exports = {
   getDriverStatus,
   updateStatus,
   updateLocation,
+  updateLiveLocation,
   syncStatusCache,
 };

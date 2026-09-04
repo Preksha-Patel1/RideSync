@@ -3,4 +3,5 @@ node_modules/
 npm-debug.log
 claude.md
 README.md
-process.md       
+process.md
+dump.rdb

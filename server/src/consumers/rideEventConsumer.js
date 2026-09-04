@@ -1,5 +1,6 @@
 const { kafka } = require("../config/kafka");
-const { KAFKA_TOPICS, KAFKA_CONSUMER_GROUP } = require("../config/constants");
+const { KAFKA_TOPICS, KAFKA_CONSUMER_GROUP, SOCKET_EVENTS } = require("../config/constants");
+const { getIO } = require("../config/socket");
 
 const consumer = kafka.consumer({ groupId: KAFKA_CONSUMER_GROUP });
 let isConsumerRunning = false;
@@ -72,9 +73,36 @@ async function handleMessage(message) {
     console.log(
       `Event processing completed: ${event.eventType} — ride ${rideId}, rider ${riderId}, driver ${driverId || "none"}`
     );
+
+    // The one place Kafka (backend event transport) and Socket.IO (client
+    // real-time delivery) meet. Kafka doesn't know or care whether anyone
+    // is listening; io.to(room).emit() on a room nobody has joined yet
+    // (e.g. right after ride.requested, before the rider's client has even
+    // called join_ride) is simply a no-op, not an error.
+    broadcastRideStatus(event);
   } catch (err) {
     console.error(`Event processing failed for ${event.eventType} (${event.eventId}):`, err.message);
   }
+}
+
+function broadcastRideStatus(event) {
+  const io = getIO();
+  if (!io) {
+    console.warn(`Socket.IO not initialized yet — skipping real-time broadcast for ${event.eventType}`);
+    return;
+  }
+
+  const { rideId } = event.data;
+  // "ride.accepted" -> "accepted". Reuses the event's own type rather than a
+  // second status-name mapping table that could drift out of sync with it.
+  const status = event.eventType.split(".")[1];
+
+  io.to(`ride:${rideId}`).emit(SOCKET_EVENTS.serverToClient.rideStatusUpdated, {
+    event: SOCKET_EVENTS.serverToClient.rideStatusUpdated,
+    rideId,
+    status,
+    timestamp: event.timestamp,
+  });
 }
 
 async function stopRideEventConsumer() {

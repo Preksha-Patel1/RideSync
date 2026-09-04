@@ -1,11 +1,13 @@
 require("dotenv").config();
 
+const http = require("http");
 const mongoose = require("mongoose");
 const app = require("./app");
 const connectDB = require("./config/db");
 const { connectRedis, client: redisClient } = require("./config/redis");
 const { connectProducer, disconnectProducer } = require("./services/kafkaProducer");
 const { startRideEventConsumer, stopRideEventConsumer } = require("./consumers/rideEventConsumer");
+const { initSocket, getIO } = require("./config/socket");
 
 const PORT = process.env.PORT || 5000;
 
@@ -24,10 +26,23 @@ async function start() {
     // startRideEventConsumer() each catch their own errors internally and
     // always resolve, even if the underlying broker is unreachable.
     await connectRedis();
+
+    // http.createServer(app) explicitly, rather than letting app.listen()
+    // create one implicitly, so Socket.IO can attach to the exact same
+    // server before it starts accepting connections — one process, one
+    // port, REST and real-time side by side, not a second backend.
+    httpServer = http.createServer(app);
+    initSocket(httpServer);
+
+    // Initialized before the consumer starts: the consumer bridges Kafka
+    // events into socket-room broadcasts (see rideEventConsumer.js) and
+    // needs `io` to already exist. It degrades gracefully either way — see
+    // config/socket.js#getIO — but ordering it this way means that degraded
+    // path is the exception, not the common case.
     await connectProducer();
     await startRideEventConsumer();
 
-    httpServer = app.listen(PORT, () => {
+    httpServer.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`);
     });
   } catch (err) {
@@ -43,7 +58,15 @@ async function start() {
 async function shutdown(signal) {
   console.log(`\n${signal} received — shutting down gracefully...`);
 
-  if (httpServer) {
+  // io.close() also closes the underlying HTTP server it was attached to
+  // (since we handed it an existing http.Server rather than letting
+  // Socket.IO create its own), so this one call both disconnects every open
+  // socket and stops accepting new REST requests.
+  const io = getIO();
+  if (io) {
+    await new Promise((resolve) => io.close(resolve));
+    console.log("Socket.IO and HTTP server closed");
+  } else if (httpServer) {
     await new Promise((resolve) => httpServer.close(resolve));
     console.log("HTTP server closed");
   }
