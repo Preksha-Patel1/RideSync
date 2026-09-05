@@ -337,5 +337,35 @@ Swapping the simulator for a real provider means writing `razorpayPaymentProvide
 ### Remaining (deliberately out of scope for Day 7)
 Razorpay (by explicit instruction), retrying a failed payment (see "1:1 by construction" above), refunds, wallets, coupons, surge pricing, transactional outbox (the publish-after-commit gap from Day 5 applies identically to payment events — same documented tradeoff, not newly introduced), a real automated test framework (still throwaway scripts), rate limiting, structured logging/observability, Docker/Kubernetes/AWS.
 
+### Next Step (superseded — see Day 8 below)
+Day 8 built the frontend before any of the above — see its own "Next Step" below for what's still open.
+
+## Day 8 — React Frontend (COMPLETE)
+
+A full React + Vite + Tailwind frontend was added at `../client`, integrated directly against this backend's real
+REST API and Socket.IO server — no mock data, no fabricated responses. Full detail (structure, pages, hooks,
+architecture, and the honest list of backend gaps the UI works around rather than hides) lives in
+`../client/README.md`, since this is frontend work rather than a backend change; nothing in `server/src` was
+modified for Day 8.
+
+### Testing
+Verified with real, driven browser sessions (Playwright against a headless Chromium, screenshots inspected, console
+errors checked) rather than a build-only check: landing page (desktop + mobile viewport), registration and login for
+both roles, driver onboarding, and — most importantly — the complete rider-to-payment lifecycle end to end: ride
+booked with real map-derived coordinates, driver accepted, rider saw the acceptance live via the Kafka → Socket.IO
+bridge (Day 5/6), ride started and completed with live status on both sides, and payment succeeded showing the
+real backend-calculated fare. Found and fixed one real bug in the process: the live-update handler was patching only
+the `status` field locally instead of re-fetching the full ride, so a rider's screen never actually learned who their
+driver was after acceptance — fixed by having the shared `useLiveRide` hook re-fetch the complete ride on every
+`ride_status_updated` event instead of hand-patching one field.
+
+Also hit, mid-session, a stale Kafka producer connection on the long-running backend process (consistent with Day
+5/7's documented "producer marks itself disconnected after a send failure and doesn't reconnect automatically" — see
+above) — resolved by restarting the backend process, not a code change.
+
 ### Next Step
-This closes the originally planned 7-day build. Natural next steps: a real Razorpay integration behind the existing `PaymentProvider` abstraction; a driver-reservation-with-TTL on top of Day 6's real-time layer; a proper automated test suite (Jest/Mocha) replacing the throwaway scripts used through every day of this build; structured logging, rate limiting, and observability for anything resembling production readiness.
+A real Razorpay integration behind the existing `PaymentProvider` abstraction; a driver-reservation-with-TTL on top
+of Day 6's real-time layer (which would also finally let the frontend's incoming-request UI go live); a proper
+automated test suite (Jest/Mocha, and Playwright for the frontend) replacing the throwaway scripts used through
+every day of this build; structured logging, rate limiting, and observability for anything resembling production
+readiness.
