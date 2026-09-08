@@ -99,6 +99,12 @@ const SOCKET_EVENTS = {
     rideStatusUpdated: "ride_status_updated",
     driverLocationUpdated: "driver_location_updated",
     paymentStatusUpdated: "payment_status_updated",
+    // Pushed to a specific driver's personal room (`driver:<userId>`, see
+    // config/socket.js) when they're the nearest-match candidate for a new
+    // ride — the piece Day 6 originally left advisory-only/frontend-only.
+    // Unlike the other events above, this isn't broadcast to a *ride* room
+    // (the driver hasn't accepted, so isn't a participant yet).
+    newRideRequest: "new_ride_request",
     rideError: "ride_error",
   },
 };

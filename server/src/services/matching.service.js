@@ -4,9 +4,33 @@ const { DRIVER_SEARCH_RADIUS_METERS, REDIS_KEYS } = require("../config/constants
 
 // $near returns results sorted nearest-first, so the first available driver
 // within the radius is already the closest one — no in-memory sort needed.
+//
+// Two passes, real drivers first: scripts/seedDrivers.js's simulated
+// drivers sit at fixed demo coordinates so a demo always has someone
+// nearby, but that means a *real* driver testing/working from that same
+// area is often equidistant with one of them — plain distance sorting has
+// no reason to prefer either, and would sometimes silently hand the ride to
+// a bot while a real driver's app never gets notified. Simulated drivers
+// exist to stand in for a missing real driver (see
+// driverSimulationService.js), not to compete with one who's actually
+// there, so a real available driver in range always wins; the simulated
+// pool is only consulted if that first pass finds nobody.
 async function findNearestAvailableDriverFromMongo(pickupCoordinates) {
+  const nearestReal = await Driver.findOne({
+    status: "available",
+    isSimulated: { $ne: true },
+    currentLocation: {
+      $near: {
+        $geometry: { type: "Point", coordinates: pickupCoordinates },
+        $maxDistance: DRIVER_SEARCH_RADIUS_METERS,
+      },
+    },
+  });
+  if (nearestReal) return nearestReal;
+
   return Driver.findOne({
     status: "available",
+    isSimulated: true,
     currentLocation: {
       $near: {
         $geometry: { type: "Point", coordinates: pickupCoordinates },
@@ -25,7 +49,13 @@ async function findNearestAvailableDriverFromMongo(pickupCoordinates) {
 // no candidate — either because it's down/unreachable (redisService already
 // swallows that and returns null) or because the geo set is genuinely empty
 // (e.g. right after a fresh Redis start, before any driver has re-reported
-// their location — a known Day 4 limitation, see README).
+// their location — a known Day 4 limitation, see README). In practice this
+// is *always* the path taken right now: this project's Redis build doesn't
+// support GEOSEARCH at all (see redis.service.js), so nearestDriverId below
+// is always null. The Redis-hit branch below doesn't share
+// findNearestAvailableDriverFromMongo's real-before-simulated preference -
+// harmless today since that branch never actually runs, but worth revisiting
+// alongside it if this project's Redis is ever upgraded past 6.2.
 async function findNearestAvailableDriver(pickupCoordinates) {
   const [longitude, latitude] = pickupCoordinates;
 

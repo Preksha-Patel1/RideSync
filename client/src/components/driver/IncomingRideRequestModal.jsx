@@ -6,10 +6,10 @@ import * as rideApi from "../../services/rideApi";
 import { getErrorMessage } from "../../services/api";
 import { useToast } from "../../context/ToastContext";
 
-// Presentational + wired to real endpoints, ready for the day
-// `useIncomingRideRequest` actually receives something (see that hook's
-// comment for the backend capability this depends on). `request` is
-// expected to at least carry `{ rideId, pickup, destination, rider }`.
+// `request` is the payload from useIncomingRideRequest's "new_ride_request"
+// event: `{ rideId, pickup: { address }, destination: { address },
+// rider: { name } }` — see rideEventConsumer.js#notifyMatchedDriver, which
+// builds it.
 export default function IncomingRideRequestModal({ request, onAccepted, onDismiss }) {
   const { showToast } = useToast();
   const [processing, setProcessing] = useState(false);

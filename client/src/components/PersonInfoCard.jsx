@@ -1,13 +1,12 @@
-import { Phone } from "lucide-react";
+import { Phone, Star } from "lucide-react";
 import { initials } from "../utils/format";
 
 // Shown for whichever counterpart (driver, on the rider's screen; rider, on
-// the driver's screen) is populated on the ride. Deliberately shows only
-// name and phone — the two fields actually present on the populated `User`
-// document (server/src/services/ride.service.js#populateRide populates
-// `driver`/`rider` from the User model, minus password). There is no
-// vehicle-details-per-ride or rating field anywhere in the Day 1-7 backend,
-// so this never fabricates either — see README "Known Limitations".
+// the driver's screen) is populated on the ride. Name and phone come from
+// the populated `User` document; vehicle and rating (driver only — a rider
+// has neither) are attached separately by
+// server/src/services/ride.service.js#populateRide from the Driver/Vehicle
+// documents, so they're simply absent (and not rendered) on a rider's card.
 export default function PersonInfoCard({ person, roleLabel }) {
   if (!person) return null;
 
@@ -19,6 +18,21 @@ export default function PersonInfoCard({ person, roleLabel }) {
       <div className="min-w-0 flex-1">
         <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">{roleLabel}</p>
         <p className="truncate font-semibold text-slate-900">{person.name}</p>
+        {(person.vehicle || typeof person.rating === "number") && (
+          <div className="mt-0.5 flex items-center gap-2 text-xs text-slate-500">
+            {person.vehicle && (
+              <span className="truncate">
+                {person.vehicle.brand} {person.vehicle.model} · {person.vehicle.registrationNumber}
+              </span>
+            )}
+            {typeof person.rating === "number" && (
+              <span className="flex shrink-0 items-center gap-0.5 font-semibold text-amber-600">
+                <Star className="h-3 w-3 fill-amber-400 text-amber-400" />
+                {person.rating.toFixed(1)}
+              </span>
+            )}
+          </div>
+        )}
       </div>
       {person.phone && (
         <a

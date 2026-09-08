@@ -8,7 +8,7 @@ const USER_KEY = "ridesync_user";
 
 function readStoredUser() {
   try {
-    const raw = localStorage.getItem(USER_KEY);
+    const raw = sessionStorage.getItem(USER_KEY);
     return raw ? JSON.parse(raw) : null;
   } catch {
     return null;
@@ -16,10 +16,11 @@ function readStoredUser() {
 }
 
 // The single source of truth for "who is logged in" across the whole app.
-// Holds the user + token, persists both to localStorage so a page refresh
-// doesn't lose the session, and owns the Socket.IO connection's lifecycle —
-// connecting once a token exists, disconnecting on logout — so no page has
-// to remember to do either itself.
+// Holds the user + token, persists both to sessionStorage so a page refresh
+// doesn't lose the session (but a closed tab does — see api.js's getToken
+// for why sessionStorage over localStorage), and owns the Socket.IO
+// connection's lifecycle — connecting once a token exists, disconnecting on
+// logout — so no page has to remember to do either itself.
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(readStoredUser);
   const [token, setTokenState] = useState(getToken);
@@ -30,9 +31,9 @@ export function AuthProvider({ children }) {
     setTokenState(nextToken);
     setToken(nextToken);
     if (nextUser) {
-      localStorage.setItem(USER_KEY, JSON.stringify(nextUser));
+      sessionStorage.setItem(USER_KEY, JSON.stringify(nextUser));
     } else {
-      localStorage.removeItem(USER_KEY);
+      sessionStorage.removeItem(USER_KEY);
     }
   }, []);
 

@@ -4,8 +4,10 @@ const Driver = require("../models/Driver");
 const ApiError = require("../utils/ApiError");
 const matchingService = require("./matching.service");
 const driverService = require("./driver.service");
+const driverSimulationService = require("./driverSimulationService");
 const kafkaProducer = require("./kafkaProducer");
-const { KAFKA_TOPICS, RIDE_EVENT_TYPES } = require("../config/constants");
+const { notifyMatchedDriver } = require("../consumers/rideEventConsumer");
+const { KAFKA_TOPICS, RIDE_EVENT_TYPES, DRIVER_SEARCH_RADIUS_METERS } = require("../config/constants");
 
 // Reserved for future days (driver acceptance, cancellation endpoints, etc.)
 // so the valid-transition map lives in one place from Day 1 onward.
@@ -32,14 +34,27 @@ async function createRide(riderId, { pickup, destination }) {
     destination,
     status: "requested",
   });
+  console.log(`[Ride] Created: ${ride._id} — status: REQUESTED`);
 
   // Best-effort nearby-driver lookup: it only annotates the ride with a
   // candidate for display purposes, so a lookup failure or empty result
   // must never block ride creation itself.
+  console.log(`[Ride] Searching for available driver near [${pickup.location.coordinates}]`);
   const nearestDriver = await matchingService.findNearestAvailableDriver(pickup.location.coordinates);
   if (nearestDriver) {
+    console.log(`[Ride] Driver selected: ${nearestDriver.user} (driver doc ${nearestDriver._id})`);
     ride.matchedDriver = nearestDriver.user;
     await ride.save();
+
+    // Demo/portfolio mode: a seeded simulated driver stands in for the real
+    // driver app that would otherwise need to be open to accept this ride.
+    // A real matched driver is untouched — they keep the normal manual
+    // accept/reject flow via their own session.
+    if (nearestDriver.isSimulated) {
+      driverSimulationService.scheduleSimulatedAcceptance(ride._id, nearestDriver.user);
+    }
+  } else {
+    console.log("[Ride] No available driver found within search radius");
   }
 
   // Database first, then publish: the event must describe something that
@@ -49,20 +64,50 @@ async function createRide(riderId, { pickup, destination }) {
   // something exists that MongoDB never has a record of. publishEvent()
   // itself never throws (see kafkaProducer.js), so a Kafka outage here
   // can't undo or fail this already-successful ride creation.
+  // matchedDriverId (distinct from driverId, which stays null until an
+  // accept) is what lets the consumer notify the one candidate driver of
+  // this new request — see consumers/rideEventConsumer.js. It's still
+  // purely advisory: the consumer's notification doesn't reserve anything,
+  // any available driver can still accept (see matching.service.js).
   await kafkaProducer.publishEvent(KAFKA_TOPICS.rideEvents, RIDE_EVENT_TYPES.requested, {
     rideId: ride._id.toString(),
     riderId: riderId.toString(),
     driverId: null,
+    matchedDriverId: nearestDriver ? nearestDriver.user.toString() : null,
   });
 
   return populateRide(ride._id);
 }
 
-function populateRide(rideId) {
-  return Ride.findById(rideId)
+// .lean() because this is purely a read path — every caller only ever
+// serializes the result into a JSON response, never re-saves it (mutations
+// happen on the separate, non-lean documents fetched inside each
+// transition function above). That makes it safe to bolt extra fields onto
+// the plain object below, which a real Mongoose document's schema-bound
+// toJSON would otherwise silently drop.
+async function populateRide(rideId) {
+  const ride = await Ride.findById(rideId)
     .populate("rider", "-password")
     .populate("driver", "-password")
-    .populate("matchedDriver", "-password");
+    .populate("matchedDriver", "-password")
+    .lean();
+
+  // Ride only references the driver's User account (name/phone) — vehicle
+  // and rating live on the separate Driver/Vehicle documents (see
+  // models/Driver.js, models/Vehicle.js). Attached here, once, so every
+  // caller (createRide, acceptRide, getRideById, ...) gets the same shape
+  // without duplicating this lookup at each call site.
+  if (ride && ride.driver) {
+    const driverProfile = await Driver.findOne({ user: ride.driver._id })
+      .select("rating")
+      .populate("vehicle")
+      .lean();
+    if (driverProfile) {
+      ride.driver = { ...ride.driver, rating: driverProfile.rating, vehicle: driverProfile.vehicle };
+    }
+  }
+
+  return ride;
 }
 
 async function getRideById(rideId, requestingUser) {
@@ -155,6 +200,8 @@ async function acceptRide(rideId, driverUser) {
   // REDIS_DRIVER_TTL_SECONDS after this driver actually went busy.
   await driverService.syncStatusCache(claimedDriverForCache);
 
+  console.log(`[Ride] Driver accepted: ${ride._id} — driver ${driverUser._id} — status changed: ACCEPTED`);
+
   // Published only after the transaction above has actually committed — see
   // createRide's comment for why this ordering is non-negotiable.
   await kafkaProducer.publishEvent(KAFKA_TOPICS.rideEvents, RIDE_EVENT_TYPES.accepted, {
@@ -162,6 +209,7 @@ async function acceptRide(rideId, driverUser) {
     riderId: existingRide.rider.toString(),
     driverId: driverUser._id.toString(),
   });
+  console.log(`[Socket] Notifying rider ${existingRide.rider} of acceptance (via ride:${ride._id} room)`);
 
   return populateRide(ride._id);
 }
@@ -225,6 +273,7 @@ async function completeRide(rideId, driverUser) {
   // See acceptRide's matching comment: MongoDB's write just committed, so
   // Redis needs to move with it rather than wait out its TTL.
   await driverService.syncStatusCache(driver);
+  await matchWaitingRideToDriver(driver);
 
   await kafkaProducer.publishEvent(KAFKA_TOPICS.rideEvents, RIDE_EVENT_TYPES.completed, {
     rideId: ride._id.toString(),
@@ -280,6 +329,7 @@ async function cancelRide(rideId, user) {
 
   if (freedDriverForCache) {
     await driverService.syncStatusCache(freedDriverForCache);
+    await matchWaitingRideToDriver(freedDriverForCache);
   }
 
   await kafkaProducer.publishEvent(KAFKA_TOPICS.rideEvents, RIDE_EVENT_TYPES.cancelled, {
@@ -290,6 +340,54 @@ async function cancelRide(rideId, user) {
   });
 
   return populateRide(ride._id);
+}
+
+// Matching (createRide) only ever runs once, at request time — if nobody
+// was available then, the ride just sits at "requested" with no
+// matchedDriver forever, even if a driver frees up moments later. This
+// closes that gap from the other direction: called whenever a driver
+// transitions to "available" (see driver.controller.js#updateStatus,
+// and completeRide/cancelRide below), it looks for the single oldest
+// still-unmatched waiting ride within range and, if one exists, matches
+// this driver to it exactly the way createRide would have if the timing
+// had lined up — same notification, same simulated-acceptance hookup.
+//
+// findOneAndUpdate's filter re-checks status/matchedDriver atomically at
+// write time, the same race-safety idea as acceptRide: if two drivers
+// become available in the same instant, only one of them can claim any
+// given waiting ride.
+async function matchWaitingRideToDriver(driverDoc) {
+  if (!driverDoc || driverDoc.status !== "available") return;
+
+  const [longitude, latitude] = driverDoc.currentLocation?.coordinates || [0, 0];
+  if (longitude === 0 && latitude === 0) return; // no real location on record yet
+
+  const ride = await Ride.findOneAndUpdate(
+    {
+      status: "requested",
+      matchedDriver: null,
+      "pickup.location": {
+        $near: {
+          $geometry: { type: "Point", coordinates: [longitude, latitude] },
+          $maxDistance: DRIVER_SEARCH_RADIUS_METERS,
+        },
+      },
+    },
+    { $set: { matchedDriver: driverDoc.user } },
+    { new: true }
+  );
+
+  if (!ride) return;
+
+  console.log(`[Ride] Late-matched waiting ride ${ride._id} to newly available driver ${driverDoc.user}`);
+
+  await notifyMatchedDriver({
+    data: { rideId: ride._id.toString(), matchedDriverId: driverDoc.user.toString() },
+  });
+
+  if (driverDoc.isSimulated) {
+    driverSimulationService.scheduleSimulatedAcceptance(ride._id, driverDoc.user);
+  }
 }
 
 async function getMyRides(user, { page, limit } = {}) {
@@ -327,6 +425,7 @@ module.exports = {
   startRide,
   completeRide,
   cancelRide,
+  matchWaitingRideToDriver,
   assertValidTransition,
   VALID_TRANSITIONS,
 };

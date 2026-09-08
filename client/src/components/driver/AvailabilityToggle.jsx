@@ -1,7 +1,6 @@
 import { useState } from "react";
 import { Power, LocateFixed } from "lucide-react";
 import Button from "../Button";
-import { useGeolocation } from "../../hooks/useGeolocation";
 import * as driverApi from "../../services/driverApi";
 import { getErrorMessage } from "../../services/api";
 import { useToast } from "../../context/ToastContext";
@@ -13,7 +12,6 @@ import { useToast } from "../../context/ToastContext";
 // offline from this control, matching what the backend actually allows.
 export default function AvailabilityToggle({ status, onStatusChange }) {
   const { showToast } = useToast();
-  const { coords, requestLocation } = useGeolocation();
   const [updating, setUpdating] = useState(false);
 
   const isOnline = status === "available";
@@ -22,33 +20,35 @@ export default function AvailabilityToggle({ status, onStatusChange }) {
   async function goOnline() {
     setUpdating(true);
     try {
-      // A driver needs a real location on record before they can be
-      // matched to any ride (server/src/services/matching.service.js), so
-      // going online also reports current location if the browser allows
-      // it — falling back silently to "no location yet" if denied, exactly
-      // like the existing REST endpoint already tolerates (Driver.currentLocation
-      // simply stays at its default until an update succeeds).
-      if (navigator.geolocation) {
-        await new Promise((resolve) => {
-          navigator.geolocation.getCurrentPosition(
-            async (position) => {
-              try {
-                await driverApi.updateDriverLocation([position.coords.longitude, position.coords.latitude]);
-              } catch {
-                // Non-fatal — see comment above.
-              }
-              resolve();
-            },
-            () => resolve(),
-            { timeout: 5000 }
-          );
-        });
+      // A driver needs a real location on record before they can be matched
+      // to any ride (server/src/services/matching.service.js) — going online
+      // without one leaves the driver stuck at whatever stale/default
+      // coordinates they last had, silently invisible to matching with no
+      // indication anything is wrong. So this blocks on getting a real fix
+      // first, rather than tolerating a denial/timeout and reporting success
+      // anyway.
+      if (!navigator.geolocation) {
+        showToast("This browser doesn't support location — you can't go online without it.", "error");
+        return;
       }
+      const coords = await new Promise((resolve, reject) => {
+        navigator.geolocation.getCurrentPosition(
+          (position) => resolve([position.coords.longitude, position.coords.latitude]),
+          (err) => reject(new Error(err.message || "Unable to retrieve your location")),
+          { enableHighAccuracy: true, timeout: 8000 }
+        );
+      });
+      await driverApi.updateDriverLocation(coords);
       const res = await driverApi.updateDriverStatus("available");
       onStatusChange(res.data.data.driver.status);
       showToast("You're online and ready to receive rides.", "success");
     } catch (err) {
-      showToast(getErrorMessage(err, "We couldn't update your status."), "error");
+      showToast(
+        err.message && !err.response
+          ? `Couldn't get your location: ${err.message}. Allow location access and try again.`
+          : getErrorMessage(err, "We couldn't update your status."),
+        "error"
+      );
     } finally {
       setUpdating(false);
     }

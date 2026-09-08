@@ -65,7 +65,11 @@ export default function BookingPanel({ onRideCreated }) {
           },
         },
       });
-      onRideCreated(res.data.data.ride);
+      const ride = res.data.data.ride;
+      onRideCreated(ride);
+      if (!ride.matchedDriver) {
+        showToast("No drivers available right now. We'll keep the request open — try again shortly.", "info");
+      }
     } catch (err) {
       showToast(getErrorMessage(err, "We couldn't process your ride request. Please try again."), "error");
     } finally {

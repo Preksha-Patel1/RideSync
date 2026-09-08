@@ -1,14 +1,12 @@
 import { useCallback, useState } from "react";
 import { useSocketEvent } from "./useSocketEvent";
 
-// Genuinely wired up, but dormant today: the Day 1-7 backend never emits a
-// "new_ride_request" event to a driver — server/src/consumers/
-// rideEventConsumer.js only ever broadcasts to a *ride's* room
-// (`ride:<rideId>`), which a driver can't join before they know the ride
-// exists. This hook exists so the moment that capability is added
-// server-side (e.g. emitting to a `driver:<driverId>` room from the
-// matching service), the incoming-request UI (IncomingRideRequestModal)
-// starts working with zero changes here — see README "Known Limitations".
+// Listens for "new_ride_request", pushed by server/src/consumers/
+// rideEventConsumer.js to a driver's personal `driver:<userId>` room
+// (auto-joined on connect — see server/src/config/socket.js) whenever that
+// driver is the nearest-match candidate for a newly requested ride. Purely
+// advisory, same as `Ride.matchedDriver` itself (Day 3): any available
+// driver can still accept, this is just how the matched one finds out.
 export function useIncomingRideRequest() {
   const [request, setRequest] = useState(null);
 

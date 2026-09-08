@@ -90,6 +90,18 @@ async function geoRemove(key, driverId) {
 
 // Returns the nearest member's id (a driver's user id), or null if Redis is
 // unavailable or nothing is within range.
+//
+// GEOSEARCH itself was only added in Redis 6.2 — the portable Windows build
+// this project uses (see README "Local Redis setup") is 5.0.14.1, the
+// newest available from its source, so this always fails on that platform
+// specifically (not a transient error, and not fixable by retrying). Rather
+// than warn on every single ride request forever, that specific, permanent
+// case is logged once and then silenced; any other failure (a real outage,
+// a malformed key) still warns normally every time, since those *are*
+// actionable. Either way the MongoDB $near fallback in matching.service.js
+// already covers this — driver matching is fully correct regardless.
+let hasWarnedGeosearchUnsupported = false;
+
 async function geoSearchNearest(key, longitude, latitude, radiusMeters) {
   if (!client.isReady) return null;
   try {
@@ -101,6 +113,15 @@ async function geoSearchNearest(key, longitude, latitude, radiusMeters) {
     );
     return results[0] || null;
   } catch (err) {
+    if (/unknown command .GEOSEARCH/i.test(err.message)) {
+      if (!hasWarnedGeosearchUnsupported) {
+        console.warn(
+          "Redis GEOSEARCH is not supported by this Redis build (needs 6.2+) — falling back to MongoDB for all driver matching. This message won't repeat."
+        );
+        hasWarnedGeosearchUnsupported = true;
+      }
+      return null;
+    }
     console.warn(`Redis GEOSEARCH failed for key "${key}":`, err.message);
     return null;
   }

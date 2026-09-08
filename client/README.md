@@ -43,16 +43,22 @@ src/
 
 ## Known Limitations (backend gaps, not frontend shortcuts)
 
-- **No real-time push of new ride requests to drivers.** The Day 1–7 backend never emits an event telling an
-  available driver a ride exists — Kafka's `ride.requested` event only reaches a Socket.IO room
-  (`ride:<rideId>`) that a driver can't join before learning the ID exists. The driver dashboard has a clearly
-  labeled "Accept by Ride ID" fallback for this — it calls the real `PATCH /api/rides/:id/accept` endpoint,
-  nothing is faked, only *how the driver learns the ID* is a manual stand-in. `useIncomingRideRequest` +
-  `IncomingRideRequestModal` are fully built and would work immediately if the backend ever added a
-  `new_ride_request` socket event.
-- **No driver rating or per-ride vehicle info shown to riders.** `ride.driver`/`ride.rider` are populated from the
-  `User` model only (name, email, phone) — there's no rating field anywhere in the backend, and vehicle details
-  live on a separate `Driver`/`Vehicle` document not joined onto a ride. `PersonInfoCard` shows only what's real.
+- **Only the single nearest-matched driver gets a real-time request popup.** `POST /api/rides` picks one nearest
+  candidate (`matching.service.js`, Day 3); `rideEventConsumer.js#notifyMatchedDriver` pushes `new_ride_request` to
+  that one driver's personal room (`driver:<userId>`, auto-joined on connect — `config/socket.js`). It's still
+  advisory, not a reservation (Day 3's design) — any available driver can accept. If nobody was in range at all,
+  the rider's screen now says so explicitly ("No drivers available right now") instead of spinning forever — see
+  `ride.matchedDriver` in `ActiveRidePanel`/`BookingPanel`. The driver dashboard's "Accept by Ride ID" card remains
+  as a fallback: paste the ride's id (shown on the rider's screen) to accept it directly via the real, unmodified
+  `PATCH /api/rides/:id/accept` endpoint.
+- **The matched driver is usually simulated, not a real second session.** `scripts/seedDrivers.js` creates a handful
+  of `Driver` documents flagged `isSimulated: true`; when one of those is the nearest match,
+  `driverSimulationService.js` auto-accepts on their behalf 2-5 seconds later via the same `acceptRide` used by a
+  real driver tapping Accept — a demo convenience so the rider flow is fully explorable solo. A real (non-simulated)
+  matched driver is never auto-accepted; they keep the normal manual flow.
+- **Driver rating and vehicle info are real, but only for drivers who have them.** `ride.driver` is enriched
+  (`ride.service.js#populateRide`) with `rating`/`vehicle` from the separate `Driver`/`Vehicle` documents — seeded
+  demo drivers always have both; a driver who completed onboarding without every field might not.
 - **No "cancelled payment" state.** The backend's payment state machine is only `pending -> success | failed`
   (both terminal) — there is no cancelled status, so the UI doesn't build one either.
 - **A failed payment cannot be retried.** `Payment` has a permanent 1:1 relationship with `Ride` (unique index), so

@@ -70,13 +70,21 @@ export default function ActiveRidePanel({ ride, onRideChange, onCancelled }) {
           <RideStatusTimeline status={ride.status} />
 
           <div className="mt-6">
-            {ride.status === "requested" && (
+            {ride.status === "requested" && ride.matchedDriver && (
               <div className="flex items-center gap-3">
                 <Loader2 className="h-5 w-5 shrink-0 animate-spin text-brand-500" />
                 <div>
                   <p className="font-semibold text-slate-900">{copy.title}</p>
                   <p className="text-sm text-slate-500">{copy.description}</p>
                 </div>
+              </div>
+            )}
+            {ride.status === "requested" && !ride.matchedDriver && (
+              <div>
+                <p className="font-semibold text-amber-700">No drivers available right now</p>
+                <p className="text-sm text-slate-500">
+                  Nobody was nearby when you requested this ride. Try again shortly, or cancel and adjust your pickup.
+                </p>
               </div>
             )}
             {copy && ride.status !== "requested" && (

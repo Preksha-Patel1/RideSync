@@ -6,14 +6,14 @@ import * as rideApi from "../../services/rideApi";
 import { getErrorMessage } from "../../services/api";
 import { useToast } from "../../context/ToastContext";
 
-// Temporary, clearly-labeled stand-in for real-time ride-request push — see
-// README "Known Limitations": the Day 1-7 backend has no endpoint or socket
-// event that tells an available driver a new ride exists to discover it by.
-// A rider's dashboard/ride-details screen displays the ride's own ID, which
-// can be typed in here; this calls the real, unmodified
-// PATCH /api/rides/:id/accept endpoint — nothing about the accept flow
-// itself is faked, only *how the driver learns the ID* is a manual
-// substitute for the missing push notification.
+// A fallback alongside the real-time push (IncomingRideRequestModal /
+// useIncomingRideRequest): that notification only reaches the *one* driver
+// matching.service.js picked as nearest at request time (Day 3's
+// `matchedDriver` is advisory, singular, and never sent at all if no driver
+// was in range — see server/src/services/matching.service.js). Any other
+// available driver — or that same driver if they missed the popup — can
+// still accept by pasting the ride's id here, which a rider's screen always
+// displays. Calls the real, unmodified PATCH /api/rides/:id/accept endpoint.
 export default function AcceptByIdCard({ onAccepted }) {
   const { showToast } = useToast();
   const [rideId, setRideId] = useState("");
@@ -40,8 +40,8 @@ export default function AcceptByIdCard({ onAccepted }) {
       <div className="flex items-start gap-2.5">
         <Info className="mt-0.5 h-4 w-4 shrink-0 text-slate-400" />
         <p className="text-xs leading-relaxed text-slate-500">
-          The backend doesn't yet push new ride requests to available drivers in real time (see project README). As a
-          stand-in for testing, paste a ride ID here — a rider can find it on their ride details screen — to accept it.
+          Didn't get a request popup? Only the single nearest driver gets notified automatically. Paste a ride ID
+          here — a rider can find it on their ride details screen — to accept it anyway.
         </p>
       </div>
       <form onSubmit={handleAccept} className="mt-3 flex gap-2">

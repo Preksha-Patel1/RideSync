@@ -1,6 +1,7 @@
 const { validationResult } = require("express-validator");
 const ApiError = require("../utils/ApiError");
 const driverService = require("../services/driver.service");
+const rideService = require("../services/ride.service");
 
 async function createProfile(req, res, next) {
   try {
@@ -42,6 +43,14 @@ async function updateStatus(req, res, next) {
     }
 
     const driver = await driverService.updateStatus(req.user._id, req.body.status);
+
+    // A driver going online may be the first available candidate for a ride
+    // that was requested earlier when nobody was around — see
+    // ride.service.js#matchWaitingRideToDriver. A no-op for every other
+    // status change, and for "available" with nothing currently waiting.
+    if (driver.status === "available") {
+      await rideService.matchWaitingRideToDriver(driver);
+    }
 
     res.status(200).json({
       success: true,

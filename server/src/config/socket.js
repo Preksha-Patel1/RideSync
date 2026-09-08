@@ -31,6 +31,18 @@ function initSocket(httpServer) {
   io.on("connection", (socket) => {
     console.log(`Socket connected: user ${socket.user.id} (${socket.user.role})`);
 
+    // Every driver socket auto-joins a personal room keyed by their own
+    // user id — this is what makes it possible to notify *one specific
+    // driver* (see consumers/rideEventConsumer.js's new_ride_request
+    // broadcast) without them first having to know a ride's id and
+    // join_ride into it, the way the rider/assigned-driver ride rooms work.
+    // Unlike a ride room, there's nothing to authorize here beyond "this is
+    // their own socket" — every driver is always allowed in their own room.
+    if (socket.user.role === "driver") {
+      socket.join(`driver:${socket.user.id}`);
+      console.log(`[Socket] Driver connected: ${socket.user.id} (joined room driver:${socket.user.id})`);
+    }
+
     registerRideSocketHandlers(io, socket);
 
     socket.on("disconnect", (reason) => {

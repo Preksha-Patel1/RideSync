@@ -22,8 +22,14 @@ export function connectSocket(token) {
     auth: { token },
     transports: ["websocket"],
     reconnection: true,
-    reconnectionAttempts: 10,
+    // Infinity, not a fixed count: a page left open across a longer backend
+    // restart/outage should keep quietly retrying (with socket.io's own
+    // capped exponential backoff, reconnectionDelayMax below) rather than
+    // permanently giving up and leaving the tab silently stuck with no
+    // real-time updates until the user thinks to refresh it.
+    reconnectionAttempts: Infinity,
     reconnectionDelay: 1000,
+    reconnectionDelayMax: 5000,
   });
 
   return socket;

@@ -2,6 +2,6 @@ node_modules/
 .env
 npm-debug.log
 claude.md
-README.md
+
 process.md
 dump.rdb

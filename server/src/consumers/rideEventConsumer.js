@@ -1,6 +1,7 @@
 const { kafka } = require("../config/kafka");
-const { KAFKA_TOPICS, KAFKA_CONSUMER_GROUP, SOCKET_EVENTS } = require("../config/constants");
+const { KAFKA_TOPICS, KAFKA_CONSUMER_GROUP, RIDE_EVENT_TYPES, SOCKET_EVENTS } = require("../config/constants");
 const { getIO } = require("../config/socket");
+const Ride = require("../models/Ride");
 
 const consumer = kafka.consumer({ groupId: KAFKA_CONSUMER_GROUP });
 let isConsumerRunning = false;
@@ -80,6 +81,10 @@ async function handleMessage(message) {
     // (e.g. right after ride.requested, before the rider's client has even
     // called join_ride) is simply a no-op, not an error.
     broadcastRideStatus(event);
+
+    if (event.eventType === RIDE_EVENT_TYPES.requested && event.data.matchedDriverId) {
+      await notifyMatchedDriver(event);
+    }
   } catch (err) {
     console.error(`Event processing failed for ${event.eventType} (${event.eventId}):`, err.message);
   }
@@ -105,6 +110,39 @@ function broadcastRideStatus(event) {
   });
 }
 
+// The one deliberate exception to "this consumer never reads the ride's own
+// data, only the event's" (see the comment above handleMessage): the Kafka
+// event payload is kept minimal, by design, matching every other event this
+// project publishes — it carries ids, not addresses. A driver deciding
+// whether to accept genuinely needs pickup/destination/rider name, so this
+// does one cheap, read-only lookup to build a real-time-only notification
+// payload. It never re-derives or re-applies any business decision — the
+// ride's actual state was already committed to MongoDB before this event
+// was even published (ride.service.js's "database first" ordering).
+async function notifyMatchedDriver(event) {
+  const io = getIO();
+  if (!io) {
+    console.warn("Socket.IO not initialized yet — skipping new-ride-request notification");
+    return;
+  }
+
+  const { rideId, matchedDriverId } = event.data;
+
+  const ride = await Ride.findById(rideId).populate("rider", "name");
+  // The ride could already be gone/reassigned by the time this runs (e.g.
+  // cancelled milliseconds later) — silently skipping is correct here,
+  // the same way a stale push notification would just be ignored client-side.
+  if (!ride) return;
+
+  console.log(`[Socket] Sending newRideRequest to driver: ${matchedDriverId} (room driver:${matchedDriverId})`);
+  io.to(`driver:${matchedDriverId}`).emit(SOCKET_EVENTS.serverToClient.newRideRequest, {
+    rideId: ride._id.toString(),
+    pickup: { address: ride.pickup.address },
+    destination: { address: ride.destination.address },
+    rider: { name: ride.rider?.name },
+  });
+}
+
 async function stopRideEventConsumer() {
   if (!isConsumerRunning) return;
   try {
@@ -116,4 +154,9 @@ async function stopRideEventConsumer() {
   }
 }
 
-module.exports = { startRideEventConsumer, stopRideEventConsumer };
+// Exported so ride.service.js can reuse the exact same "push a new-ride
+// notification to one driver" logic when it late-matches a ride to a driver
+// who only became available after the ride was created (see
+// matchWaitingRideToDriver) — rather than duplicating this lookup+emit here
+// a second time.
+module.exports = { startRideEventConsumer, stopRideEventConsumer, notifyMatchedDriver };

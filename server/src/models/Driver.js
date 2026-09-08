@@ -37,6 +37,21 @@ const driverSchema = new mongoose.Schema(
       type: pointSchema,
       default: () => ({ type: "Point", coordinates: [0, 0] }),
     },
+    rating: {
+      type: Number,
+      min: 1,
+      max: 5,
+      default: 4.5,
+    },
+    // Set only by scripts/seedDrivers.js. Lets matching-time code (see
+    // ride.service.js#createRide) distinguish a demo/bot driver — safe to
+    // auto-accept on behalf of — from a real driver, who should always get
+    // the normal manual accept/reject flow even if they happen to be the
+    // nearest match.
+    isSimulated: {
+      type: Boolean,
+      default: false,
+    },
   },
   { timestamps: true }
 );

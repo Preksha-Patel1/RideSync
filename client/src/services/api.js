@@ -14,15 +14,21 @@ const api = axios.create({
 
 const TOKEN_KEY = "ridesync_token";
 
+// sessionStorage, not localStorage: each browser tab gets its own isolated
+// session instead of sharing one login across every tab of the same
+// browser. That matters here specifically because testing this app means
+// being logged in as a rider and a driver at the same time — with
+// localStorage, logging into the driver account in one tab would silently
+// overwrite the rider's token used by every other open tab.
 export function getToken() {
-  return localStorage.getItem(TOKEN_KEY);
+  return sessionStorage.getItem(TOKEN_KEY);
 }
 
 export function setToken(token) {
   if (token) {
-    localStorage.setItem(TOKEN_KEY, token);
+    sessionStorage.setItem(TOKEN_KEY, token);
   } else {
-    localStorage.removeItem(TOKEN_KEY);
+    sessionStorage.removeItem(TOKEN_KEY);
   }
 }
 
