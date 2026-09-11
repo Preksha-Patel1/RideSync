@@ -1,6 +1,6 @@
 # RideSync
 
-A ride-hailing platform with real-time driver matching, event-driven ride processing, and live tracking — built with a Node.js/Express backend and a React frontend.
+**RideSync** — A scalable ride-hailing platform featuring **real-time driver matching, event-driven ride processing, geospatial location services, Redis-based driver state management, and real-time ride updates**. Built with **Node.js, Express.js, React, MongoDB, Redis, Kafka, and Socket.IO**, with a structured ride lifecycle, authentication/authorization, and payment workflow designed to simulate a production-grade ride-booking system.
 
 ## 🚀 Overview
 
